@@ -3,12 +3,14 @@
  *
  * With no arguments: embedded sample, print AST, typecheck, evaluate several pub fns.
  * With a file path: read source, typecheck only (no AST dump, no eval) — for CI and `make test`.
+ * With -i / --repl: interactive REPL.
  */
 #include "ast.h"
 #include "eval.h"
 #include "lexer.h"
 #include "parser.h"
 #include "types.h"
+#include "repl.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,9 +99,10 @@ static char *read_file_contents(const char *path) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [file.mons]\n"
-            "  no args   run embedded demo (AST + typecheck + eval)\n"
-            "  file.mons lex, parse, and typecheck only\n",
+            "usage: %s [-i|--repl] [file.mons]\n"
+            "  no args      run embedded demo (AST + typecheck + eval)\n"
+            "  -i, --repl   interactive read-eval-print loop\n"
+            "  file.mons    lex, parse, and typecheck only\n",
             argv0);
 }
 
@@ -208,6 +211,10 @@ int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
         return 0;
+    }
+
+    if (argc >= 2 && (strcmp(argv[1], "-i") == 0 || strcmp(argv[1], "--repl") == 0)) {
+        return repl_run();
     }
 
     if (argc >= 2) {
