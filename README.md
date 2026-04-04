@@ -344,7 +344,7 @@ Built-in generic types:
 - **Struct literals** `Type { f: e, }`, **field access**, and **struct update** `Type { f: v, ..base, }` (spread must appear after explicit fields in the current parser).
 - **Arrays** and **tuples**: literals, indexing; tuple indices must be **integer literals** in the type checker.
 
-**Deferred (bytecode still catching up to Phase 1)** in this repo: `impl` / trait parsing, **`match`**, **lambdas / closures** (grammar only; not parsed end-to-end), **`try` / `catch` / `finally`** (parser rejects `try` today), AST **macro** expansion pass, **`use` imports**, bytecode for composites / `if` / `&&`/`||` / methods, tracing **GC** — see DESIGN. **Cross-function calls** and a **stdlib prelude** for VM smoke are implemented; **`--reflect`** lists public API shapes from the AST.
+**Deferred (bytecode still catching up to Phase 1)** in this repo: `impl` / trait parsing, **`match`**, **`try` / `catch` / `finally`** (parser rejects `try` today), AST **macro** expansion pass, **`use` imports**, bytecode for composites / `if` / `&&`/`||` / methods / **lambdas**, tracing **GC** — see DESIGN. **Lambdas / closures** run on the **tree-walk interpreter** (`|x|`, `||`, captures, HOF calls). **Cross-function calls** and a **stdlib prelude** for VM smoke are implemented; **`--reflect`** lists public API shapes from the AST.
 
 ---
 
@@ -364,7 +364,7 @@ Phase 1 — Tree-walk interpreter (complete)
 Phase 2 — Bytecode VM
   ✓ Phase 2A: stack bytecode + `Chunk`, compiler subset, stack VM, `./mons --vm-test`
   ◐ Phase 2B: **calls** (`compile_program_bc`, `OP_CALL`, `vm_run_program`); broader types, optional register machine, tracing GC still open
-  ✓ Phase 2C: **reflection** (`--reflect`), **stdlib** prelude (`stdlib/core.mons` + VM smoke); lambdas/closures deferred
+  ✓ Phase 2C: **reflection** (`--reflect`), **stdlib** prelude, **closures** in interpreter; bytecode lambdas deferred
 
 Phase 3 — Native code (optional)
   ▸ C code emission or LLVM IR backend
@@ -386,6 +386,7 @@ mons-lang/
 │   └── core.mons           # Prepended for `./mons --vm-test`
 ├── tests/
 │   ├── smoke.mons          # `make test` — parse + typecheck (`bump(K)`)
+│   ├── closure.mons        # `make test` — lambdas + captures (typecheck)
 │   └── vm_smoke.mons       # With stdlib: VM smoke (`twice(K)` → 14)
 │
 ├── include/

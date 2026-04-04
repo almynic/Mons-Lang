@@ -73,6 +73,8 @@ Value value_retain(Value v) {
         v.as.seq->refc++;
     } else if (v.kind == VAL_STRUCT && v.as.st) {
         v.as.st->refc++;
+    } else if (v.kind == VAL_CLOSURE && v.as.closure) {
+        v.as.closure->refc++;
     }
     return v;
 }
@@ -101,6 +103,17 @@ void value_release(Value *v) {
                 free(v->as.st->field_names);
                 free(v->as.st->values);
                 free(v->as.st);
+            }
+            break;
+        case VAL_CLOSURE:
+            if (v->as.closure && --v->as.closure->refc == 0) {
+                ValClosure *cl = v->as.closure;
+                for (i = 0; i < cl->ncap; i++) {
+                    value_release(&cl->cap_vals[i]);
+                }
+                free(cl->cap_vals);
+                free(cl->cap_names);
+                free(cl);
             }
             break;
         default:
@@ -233,6 +246,185 @@ void value_fprint(FILE *fp, const Value *v) {
             }
             fprintf(fp, "}");
             break;
+        case VAL_CLOSURE:
+            fprintf(fp, "<closure>");
+            break;
+    }
+}
+
+#define LAMBDA_BOUND_MAX 96u
+
+static bool fv_bound_has(const char *stack[], size_t nb, const char *name) {
+    size_t i;
+    for (i = 0; i < nb; i++) {
+        if (strcmp(stack[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fv_cap_add(const char ***caps, size_t *nc, size_t *capa, const char *name) {
+    size_t i;
+    for (i = 0; i < *nc; i++) {
+        if (strcmp((*caps)[i], name) == 0) {
+            return;
+        }
+    }
+    if (*nc >= *capa) {
+        size_t ncap = *capa == 0 ? 8u : *capa * 2u;
+        const char **na = (const char **)realloc(*caps, ncap * sizeof(const char *));
+        if (!na) {
+            return;
+        }
+        *caps = na;
+        *capa = ncap;
+    }
+    (*caps)[*nc] = name;
+    (*nc)++;
+}
+
+static void fv_walk(AstNode *n, const char *bound[], size_t nb, const char ***caps, size_t *nc, size_t *capa);
+
+static void fv_block(AstNode *block, const char *bound[], size_t nb, const char ***caps, size_t *nc, size_t *capa) {
+    const char *stack[LAMBDA_BOUND_MAX];
+    size_t nbs = nb;
+    AstList *sl;
+
+    if (block->kind != NODE_BLOCK || nbs > LAMBDA_BOUND_MAX) {
+        return;
+    }
+    memcpy(stack, bound, nb * sizeof(bound[0]));
+
+    for (sl = AS_BLOCK(block).stmts; sl; sl = sl->next) {
+        AstNode *st = sl->item;
+        if (st->kind == NODE_LET) {
+            fv_walk(AS_LET(st).init, stack, nbs, caps, nc, capa);
+            if (nbs < LAMBDA_BOUND_MAX) {
+                stack[nbs++] = AS_LET(st).name;
+            }
+        } else if (st->kind == NODE_EXPR_STMT) {
+            fv_walk(AS_EXPR_STMT(st).expr, stack, nbs, caps, nc, capa);
+        } else if (st->kind == NODE_RETURN && AS_RETURN(st).value) {
+            fv_walk(AS_RETURN(st).value, stack, nbs, caps, nc, capa);
+        } else if (st->kind == NODE_FOR) {
+            fv_walk(AS_FOR(st).iter, stack, nbs, caps, nc, capa);
+            if (nbs < LAMBDA_BOUND_MAX) {
+                const char *st2[LAMBDA_BOUND_MAX];
+                memcpy(st2, stack, nbs * sizeof(stack[0]));
+                st2[nbs] = AS_FOR(st).var;
+                fv_block(AS_FOR(st).body, st2, nbs + 1u, caps, nc, capa);
+            }
+        }
+    }
+    if (AS_BLOCK(block).tail_expr) {
+        fv_walk(AS_BLOCK(block).tail_expr, stack, nbs, caps, nc, capa);
+    }
+}
+
+static void fv_walk(AstNode *n, const char *bound[], size_t nb, const char ***caps, size_t *nc, size_t *capa) {
+    AstList *al;
+    if (!n) {
+        return;
+    }
+    switch (n->kind) {
+        case NODE_IDENT:
+            if (!fv_bound_has(bound, nb, AS_IDENT(n).name)) {
+                fv_cap_add(caps, nc, capa, AS_IDENT(n).name);
+            }
+            return;
+        case NODE_BINARY:
+            fv_walk(AS_BINARY(n).left, bound, nb, caps, nc, capa);
+            fv_walk(AS_BINARY(n).right, bound, nb, caps, nc, capa);
+            return;
+        case NODE_UNARY:
+            fv_walk(AS_UNARY(n).operand, bound, nb, caps, nc, capa);
+            return;
+        case NODE_CALL:
+            fv_walk(AS_CALL(n).callee, bound, nb, caps, nc, capa);
+            for (al = AS_CALL(n).args; al; al = al->next) {
+                fv_walk(al->item, bound, nb, caps, nc, capa);
+            }
+            return;
+        case NODE_METHOD_CALL:
+            fv_walk(AS_METHOD_CALL(n).receiver, bound, nb, caps, nc, capa);
+            for (al = AS_METHOD_CALL(n).args; al; al = al->next) {
+                fv_walk(al->item, bound, nb, caps, nc, capa);
+            }
+            return;
+        case NODE_FIELD_ACCESS:
+            fv_walk(AS_FIELD_ACCESS(n).object, bound, nb, caps, nc, capa);
+            return;
+        case NODE_INDEX:
+            fv_walk(AS_INDEX(n).object, bound, nb, caps, nc, capa);
+            fv_walk(AS_INDEX(n).index, bound, nb, caps, nc, capa);
+            return;
+        case NODE_ASSIGN:
+            fv_walk(AS_ASSIGN(n).target, bound, nb, caps, nc, capa);
+            fv_walk(AS_ASSIGN(n).value, bound, nb, caps, nc, capa);
+            return;
+        case NODE_BLOCK:
+            fv_block(n, bound, nb, caps, nc, capa);
+            return;
+        case NODE_IF:
+            {
+                AstList *br = AS_IF(n).branches;
+                while (br) {
+                    fv_walk(br->item, bound, nb, caps, nc, capa);
+                    br = br->next;
+                    if (!br) {
+                        break;
+                    }
+                    fv_walk(br->item, bound, nb, caps, nc, capa);
+                    br = br->next;
+                }
+                if (AS_IF(n).else_body) {
+                    fv_walk(AS_IF(n).else_body, bound, nb, caps, nc, capa);
+                }
+            }
+            return;
+        case NODE_LAMBDA:
+            {
+                const char *stack[LAMBDA_BOUND_MAX];
+                size_t n2 = nb;
+                AstList *pl;
+                if (n2 > LAMBDA_BOUND_MAX) {
+                    return;
+                }
+                memcpy(stack, bound, nb * sizeof(bound[0]));
+                for (pl = AS_LAMBDA(n).params; pl; pl = pl->next) {
+                    if (n2 >= LAMBDA_BOUND_MAX) {
+                        return;
+                    }
+                    stack[n2++] = AS_PARAM(pl->item).name;
+                }
+                if (AS_LAMBDA(n).body->kind == NODE_BLOCK) {
+                    fv_block(AS_LAMBDA(n).body, stack, n2, caps, nc, capa);
+                } else {
+                    fv_walk(AS_LAMBDA(n).body, stack, n2, caps, nc, capa);
+                }
+            }
+            return;
+        case NODE_ARRAY:
+            for (al = AS_ARRAY(n).elements; al; al = al->next) {
+                fv_walk(al->item, bound, nb, caps, nc, capa);
+            }
+            return;
+        case NODE_TUPLE:
+            for (al = AS_TUPLE(n).elements; al; al = al->next) {
+                fv_walk(al->item, bound, nb, caps, nc, capa);
+            }
+            return;
+        case NODE_STRUCT_INIT:
+            for (al = AS_STRUCT_INIT(n).fields; al; al = al->next) {
+                fv_walk(AS_FIELD_INIT(al->item).value, bound, nb, caps, nc, capa);
+            }
+            if (AS_STRUCT_INIT(n).base) {
+                fv_walk(AS_STRUCT_INIT(n).base, bound, nb, caps, nc, capa);
+            }
+            return;
+        default:
+            return;
     }
 }
 
@@ -362,11 +554,14 @@ static bool value_equal(const Value *a, const Value *b) {
             return a->as.seq == b->as.seq;
         case VAL_STRUCT:
             return a->as.st == b->as.st;
+        case VAL_CLOSURE:
+            return a->as.closure == b->as.closure;
         default:
             return false;
     }
 }
 
+static Value eval_invoke_closure(EvalCtx *ctx, ValClosure *cl, const Value *args, size_t nargs);
 static Value eval_invoke_fn(EvalCtx *ctx, AstNode *fn, const Value *args, size_t nargs);
 
 /* Dispatch by NODE_*; see NODE_METHOD_CALL (self desugar), NODE_STRUCT_INIT (..base). */
@@ -674,30 +869,16 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
         case NODE_CALL:
             {
                 AstNode *ce = AS_CALL(n).callee;
-                if (ce->kind != NODE_IDENT) {
-                    eval_fail(ctx, "call target must be a name");
-                    return val_void();
-                }
-                const char *fname = AS_IDENT(ce).name;
-                AstNode *fn = lookup_fn(ctx->program, fname);
-                if (!fn) {
-                    eval_fail(ctx, "call to unknown function");
-                    return val_void();
-                }
-                size_t nparam = ast_list_len(AS_FN_DECL(fn).params);
                 size_t argc = ast_list_len(AS_CALL(n).args);
-                if (argc != nparam) {
-                    eval_fail_fmt(ctx, "wrong argument count (expected %ld)", (long)nparam);
-                    return val_void();
-                }
                 Value *argv = (Value *)malloc(argc * sizeof(Value));
+                AstList *al;
+                size_t i;
+
                 if (!argv && argc > 0) {
                     eval_fail(ctx, "out of memory");
                     return val_void();
                 }
-                AstList *al;
-                size_t i = 0;
-                for (al = AS_CALL(n).args; al; al = al->next, i++) {
+                for (al = AS_CALL(n).args, i = 0; al; al = al->next, i++) {
                     argv[i] = eval_expr(ctx, al->item);
                     if (ctx->error) {
                         size_t j;
@@ -708,12 +889,62 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                         return val_void();
                     }
                 }
-                Value out = eval_invoke_fn(ctx, fn, argv, argc);
-                for (i = 0; i < argc; i++) {
-                    value_release(&argv[i]);
+
+                if (ce->kind == NODE_IDENT) {
+                    Value *slot = env_lookup_slot(ctx->env, AS_IDENT(ce).name);
+                    if (slot && slot->kind == VAL_CLOSURE && slot->as.closure) {
+                        Value out = eval_invoke_closure(ctx, slot->as.closure, argv, argc);
+                        for (i = 0; i < argc; i++) {
+                            value_release(&argv[i]);
+                        }
+                        free(argv);
+                        return out;
+                    }
+                    {
+                        AstNode *fn = lookup_fn(ctx->program, AS_IDENT(ce).name);
+                        if (fn) {
+                            Value out = eval_invoke_fn(ctx, fn, argv, argc);
+                            for (i = 0; i < argc; i++) {
+                                value_release(&argv[i]);
+                            }
+                            free(argv);
+                            return out;
+                        }
+                    }
+                    eval_fail(ctx, "unknown call target");
+                    for (i = 0; i < argc; i++) {
+                        value_release(&argv[i]);
+                    }
+                    free(argv);
+                    return val_void();
                 }
-                free(argv);
-                return out;
+
+                {
+                    Value callee_v = eval_expr(ctx, ce);
+                    if (ctx->error) {
+                        for (i = 0; i < argc; i++) {
+                            value_release(&argv[i]);
+                        }
+                        free(argv);
+                        return val_void();
+                    }
+                    if (callee_v.kind == VAL_CLOSURE && callee_v.as.closure) {
+                        Value out = eval_invoke_closure(ctx, callee_v.as.closure, argv, argc);
+                        value_release(&callee_v);
+                        for (i = 0; i < argc; i++) {
+                            value_release(&argv[i]);
+                        }
+                        free(argv);
+                        return out;
+                    }
+                    value_release(&callee_v);
+                    eval_fail(ctx, "call target is not a function");
+                    for (i = 0; i < argc; i++) {
+                        value_release(&argv[i]);
+                    }
+                    free(argv);
+                    return val_void();
+                }
             }
         /* r.m(a,b) → call top-level `m` with argv = [r, a, b] (types.c requires first param name `self`). */
         case NODE_METHOD_CALL:
@@ -1035,6 +1266,74 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                 return val_void();
             }
         case NODE_LAMBDA:
+            {
+                const char *stack[LAMBDA_BOUND_MAX];
+                const char **caps = NULL;
+                size_t nc = 0;
+                size_t capa = 0;
+                size_t nb = 0;
+                AstList *pl;
+                ValClosure *cl;
+                Value out;
+                size_t j;
+
+                for (pl = AS_LAMBDA(n).params; pl; pl = pl->next) {
+                    if (nb >= LAMBDA_BOUND_MAX) {
+                        eval_fail(ctx, "too many lambda parameters for closure capture");
+                        return val_void();
+                    }
+                    stack[nb++] = AS_PARAM(pl->item).name;
+                }
+                if (AS_LAMBDA(n).body->kind == NODE_BLOCK) {
+                    fv_block(AS_LAMBDA(n).body, stack, nb, &caps, &nc, &capa);
+                } else {
+                    fv_walk(AS_LAMBDA(n).body, stack, nb, &caps, &nc, &capa);
+                }
+
+                cl = (ValClosure *)malloc(sizeof(ValClosure));
+                if (!cl) {
+                    free(caps);
+                    eval_fail(ctx, "out of memory");
+                    return val_void();
+                }
+                cl->refc = 1;
+                cl->lambda = n;
+                cl->ncap = nc;
+                cl->cap_names = (const char **)malloc(nc * sizeof(const char *));
+                cl->cap_vals = (Value *)malloc(nc * sizeof(Value));
+                if (nc > 0 && (!cl->cap_names || !cl->cap_vals)) {
+                    free(cl->cap_names);
+                    free(cl->cap_vals);
+                    free(cl);
+                    free(caps);
+                    eval_fail(ctx, "out of memory");
+                    return val_void();
+                }
+                if (nc > 0) {
+                    memcpy(cl->cap_names, caps, nc * sizeof(const char *));
+                }
+                free(caps);
+
+                for (j = 0; j < nc; j++) {
+                    Value *sl = env_lookup_slot(ctx->env, cl->cap_names[j]);
+                    if (!sl) {
+                        eval_fail(ctx, "unknown identifier in closure environment");
+                        while (j > 0) {
+                            j--;
+                            value_release(&cl->cap_vals[j]);
+                        }
+                        free(cl->cap_names);
+                        free(cl->cap_vals);
+                        free(cl);
+                        return val_void();
+                    }
+                    cl->cap_vals[j] = value_retain(*sl);
+                }
+
+                out.kind = VAL_CLOSURE;
+                out.as.closure = cl;
+                return out;
+            }
         case NODE_MACRO_CALL:
             eval_fail(ctx, "expression form not supported by interpreter yet");
             return val_void();
@@ -1147,6 +1446,62 @@ static Value eval_block(EvalCtx *ctx, AstNode *block_node) {
     if (!ctx->halt_return) {
         ctx->halt_return = prev_halt;
     }
+    return out;
+}
+
+static Value eval_lambda_body(EvalCtx *ctx, AstNode *body) {
+    if (body->kind == NODE_BLOCK) {
+        return eval_block(ctx, body);
+    }
+    return eval_expr(ctx, body);
+}
+
+/* Captures + parameters, then lambda body (block or single expr). */
+static Value eval_invoke_closure(EvalCtx *ctx, ValClosure *cl, const Value *args, size_t nargs) {
+    AstNode *lam = cl->lambda;
+    size_t nparam = ast_list_len(AS_LAMBDA(lam).params);
+    EvalEnv capf = { NULL, ctx->env };
+    EvalEnv argf = { NULL, &capf };
+    AstList *pl;
+    size_t i;
+    EvalEnv *saved;
+    Value out;
+
+    if (nargs != nparam) {
+        eval_fail_fmt(ctx, "wrong argument count (expected %ld)", (long)nparam);
+        return val_void();
+    }
+
+    for (i = 0; i < cl->ncap; i++) {
+        env_insert(ctx, &capf, cl->cap_names[i], value_retain(cl->cap_vals[i]));
+        if (ctx->error) {
+            env_free_head(&capf);
+            return val_void();
+        }
+    }
+
+    i = 0;
+    for (pl = AS_LAMBDA(lam).params; pl; pl = pl->next, i++) {
+        env_insert(ctx, &argf, AS_PARAM(pl->item).name, value_retain(args[i]));
+        if (ctx->error) {
+            env_free_head(&argf);
+            env_free_head(&capf);
+            return val_void();
+        }
+    }
+
+    saved = ctx->env;
+    ctx->env = &argf;
+    ctx->halt_return = 0;
+
+    out = eval_lambda_body(ctx, AS_LAMBDA(lam).body);
+    if (ctx->halt_return) {
+        out = ctx->return_value;
+    }
+    ctx->halt_return = 0;
+    ctx->env = saved;
+    env_free_head(&argf);
+    env_free_head(&capf);
     return out;
 }
 

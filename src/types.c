@@ -967,8 +967,99 @@ static Type *infer_expr(Checker *c, AstNode *n) {
                 return st_t;
             }
         case NODE_LAMBDA:
-            checker_fail(c, n->loc, "lambdas not type-checked yet");
-            return NULL;
+            {
+                AstNode *lam = n;
+                Env lam_env = { .head = NULL, .parent = c->current_env };
+                AstList *pl;
+                size_t nparam = ast_list_len(AS_LAMBDA(lam).params);
+                Type **pts;
+                size_t i;
+                Type *ret_goal;
+                Type *body_ty;
+                Type *ft;
+                Type *saved_exp = c->expected_return;
+
+                pts = nparam ? (Type **)malloc(nparam * sizeof(Type *)) : NULL;
+                if (nparam > 0 && !pts) {
+                    checker_fail(c, lam->loc, "out of memory");
+                    return NULL;
+                }
+                i = 0;
+                for (pl = AS_LAMBDA(lam).params; pl; pl = pl->next, i++) {
+                    AstNode *param = pl->item;
+                    Type *pt;
+                    if (AS_PARAM(param).type) {
+                        pt = ast_type_to_type(c, AS_PARAM(param).type);
+                        if (c->error) {
+                            free(pts);
+                            return NULL;
+                        }
+                    } else {
+                        pt = new_var(c);
+                        if (c->error) {
+                            free(pts);
+                            return NULL;
+                        }
+                    }
+                    env_insert(&lam_env, AS_PARAM(param).name, pt);
+                    pts[i] = pt;
+                }
+
+                if (AS_LAMBDA(lam).ret_type) {
+                    ret_goal = ast_type_to_type(c, AS_LAMBDA(lam).ret_type);
+                    if (c->error) {
+                        env_free_head(&lam_env);
+                        free(pts);
+                        return NULL;
+                    }
+                } else {
+                    ret_goal = new_var(c);
+                    if (c->error) {
+                        env_free_head(&lam_env);
+                        free(pts);
+                        return NULL;
+                    }
+                }
+
+                c->current_env = &lam_env;
+                c->expected_return = ret_goal;
+
+                if (AS_LAMBDA(lam).body->kind == NODE_BLOCK) {
+                    body_ty = infer_block(c, AS_LAMBDA(lam).body);
+                } else {
+                    body_ty = infer_expr(c, AS_LAMBDA(lam).body);
+                }
+
+                c->expected_return = saved_exp;
+                c->current_env = lam_env.parent;
+
+                if (c->error) {
+                    env_free_head(&lam_env);
+                    free(pts);
+                    return NULL;
+                }
+                if (!body_ty) {
+                    env_free_head(&lam_env);
+                    free(pts);
+                    checker_fail(c, AS_LAMBDA(lam).body->loc, "could not infer lambda body type");
+                    return NULL;
+                }
+                if (!unify(c, body_ty, ret_goal, AS_LAMBDA(lam).body->loc)) {
+                    env_free_head(&lam_env);
+                    free(pts);
+                    return NULL;
+                }
+
+                env_free_head(&lam_env);
+
+                ft = new_fn_type(c, pts, nparam, prune(ret_goal));
+                if (!ft) {
+                    free(pts);
+                    checker_fail(c, lam->loc, "out of memory");
+                    return NULL;
+                }
+                return ft;
+            }
         default:
             checker_fail(c, n->loc, "expression form not supported in type checker yet");
             return NULL;

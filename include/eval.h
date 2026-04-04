@@ -21,11 +21,13 @@ typedef enum {
     VAL_VOID,
     VAL_ARRAY,
     VAL_TUPLE,
-    VAL_STRUCT
+    VAL_STRUCT,
+    VAL_CLOSURE
 } ValKind;
 
 typedef struct ValSeq ValSeq;
 typedef struct ValStruct ValStruct;
+typedef struct ValClosure ValClosure;
 
 typedef struct Value {
     ValKind kind;
@@ -37,6 +39,7 @@ typedef struct Value {
         const char *s;
         ValSeq *seq;
         ValStruct *st;
+        ValClosure *closure;
     } as;
 } Value;
 
@@ -52,6 +55,14 @@ struct ValStruct {
     size_t n;
     const char **field_names;
     Value *values;
+};
+
+struct ValClosure {
+    size_t       refc;
+    AstNode     *lambda; /* NODE_LAMBDA — lives in program arena */
+    const char **cap_names;
+    Value       *cap_vals;
+    size_t       ncap;
 };
 
 typedef struct {

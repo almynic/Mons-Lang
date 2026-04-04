@@ -513,7 +513,8 @@ Rationale: a stack VM is quicker to land than a register allocator; the opcode l
 
 - **Reflection** (`reflection.h` / `reflection.c`): **`reflection_fprint_program`** prints a line-oriented summary of **`pub struct`**, **`pub fn`** (params + return types from the AST), and **`pub const`** for downstream tooling. CLI: **`./mons --reflect file.mons`** (parse → typecheck → summary on stdout).
 - **Stdlib** (`stdlib/core.mons`): small **bytecode-safe** helpers (`twice`, `add`, …). **`--vm-test`** prepends this file to **`tests/vm_smoke.mons`** so the VM smoke exercises a **stdlib symbol** without a `use` system yet.
-- **Deferred (not Phase 2C in this repo):** **Lambdas / upvalues / closures** — `NODE_LAMBDA` and grammar exist as design targets; the parser does not build lambdas from source yet, and the type checker rejects them. A full **tracing GC** and **`use` imports** remain later work.
+- **Lambdas / closures (tree-walk):** Parser accepts `|params| body` and `|| body` (Rust-style empty params); parameters may omit types for inference. The type checker builds **`TY_FN`** with lexical capture via the environment chain. **`eval`** represents closures as **`VAL_CLOSURE`** (captured names + values at creation time; **`fv_`** walk finds free variables). **Calls** dispatch on **`VAL_CLOSURE`** or top-level **`NODE_FN_DECL`**. Nested lambdas and higher-order calls (`mk(5)(7)`) work. **Bytecode** still rejects **`NODE_LAMBDA`** (`compile.c`).
+- **Deferred:** **Tracing GC**, **`use` imports**, **lambdas in bytecode** (upvalue opcodes / `OP_CLOSURE`).
 
 **Milestone (full Phase 2, long-term):** Mons programs run significantly faster than the tree-walk path; GC and closures support the full language + stdlib end-to-end.
 
@@ -554,6 +555,7 @@ mons-lang/
 │   └── core.mons           # Prelude for --vm-test (bytecode subset)
 ├── tests/
 │   ├── smoke.mons          # `make test` typecheck; local `bump(K)`
+│   ├── closure.mons        # `make test` — lambdas / captures (typecheck)
 │   └── vm_smoke.mons       # Concat after stdlib for `--vm-test` only
 └── src/
     ├── arena.c             # Slab arena allocator

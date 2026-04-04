@@ -103,6 +103,11 @@ static void ast_print_node(const AstNode *n, int indent) {
             ast_print_node(AS_UNARY(n).operand, indent + 2);
             break;
         }
+        case NODE_CALL:
+            printf("CALL\n");
+            ast_print_node(AS_CALL(n).callee, indent + 2);
+            print_list(AS_CALL(n).args, indent + 2, ast_print_node);
+            break;
         case NODE_IDENT:
             printf("IDENT %s\n", AS_IDENT(n).name);
             break;
@@ -168,6 +173,16 @@ static void ast_print_node(const AstNode *n, int indent) {
             printf("CONST %s%s\n", AS_CONST_DECL(n).is_pub ? "pub " : "", AS_CONST_DECL(n).name);
             ast_print_node(AS_CONST_DECL(n).type, indent + 2);
             ast_print_node(AS_CONST_DECL(n).value, indent + 2);
+            break;
+        case NODE_LAMBDA:
+            printf("LAMBDA\n");
+            print_list(AS_LAMBDA(n).params, indent + 2, ast_print_node);
+            if (AS_LAMBDA(n).ret_type) {
+                print_indent(indent + 2);
+                printf("RET\n");
+                ast_print_node(AS_LAMBDA(n).ret_type, indent + 4);
+            }
+            ast_print_node(AS_LAMBDA(n).body, indent + 2);
             break;
         default:
             printf("(node kind %d)\n", (int)n->kind);

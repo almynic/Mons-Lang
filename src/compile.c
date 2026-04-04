@@ -224,6 +224,9 @@ static void compile_expr(Ctx *c, AstNode *n) {
             }
             compile_fail(c, "unsupported unary");
             return;
+        case NODE_LAMBDA:
+            compile_fail(c, "lambdas / closures not supported in bytecode yet");
+            return;
         case NODE_CALL: {
             AstNode *cal = AS_CALL(n).callee;
             int fidx;

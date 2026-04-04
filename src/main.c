@@ -65,6 +65,20 @@ static const char *embedded_sample =
     "    let p = Point { x: 1, y: 2, };\n"
     "    let q = Point { x: 10, ..p, };\n"
     "    q.x + q.y\n"
+    "}\n"
+    "pub fn closure_add() -> int {\n"
+    "    let add = |a: int, b: int| a + b;\n"
+    "    add(2, 3)\n"
+    "}\n"
+    "pub fn closure_capture() -> int {\n"
+    "    let x = 10;\n"
+    "    let g = || x + 1;\n"
+    "    g()\n"
+    "}\n"
+    "pub fn closure_hof() -> int {\n"
+    "    let mk = |base: int| |y: int| base + y;\n"
+    "    let add5 = mk(5);\n"
+    "    add5(7)\n"
     "}\n";
 
 static char *read_file_contents(const char *path) {
@@ -358,6 +372,36 @@ static int run_demo_evals(AstNode *program) {
         return 1;
     }
     printf("eval shifted() = ");
+    value_fprint(stdout, &er.result);
+    printf("\n");
+    value_release(&er.result);
+
+    er = eval_call_by_name(program, "closure_add", NULL, 0);
+    if (!er.ok) {
+        fprintf(stderr, "eval error: %s\n", er.error_message ? er.error_message : "unknown");
+        return 1;
+    }
+    printf("eval closure_add() = ");
+    value_fprint(stdout, &er.result);
+    printf("\n");
+    value_release(&er.result);
+
+    er = eval_call_by_name(program, "closure_capture", NULL, 0);
+    if (!er.ok) {
+        fprintf(stderr, "eval error: %s\n", er.error_message ? er.error_message : "unknown");
+        return 1;
+    }
+    printf("eval closure_capture() = ");
+    value_fprint(stdout, &er.result);
+    printf("\n");
+    value_release(&er.result);
+
+    er = eval_call_by_name(program, "closure_hof", NULL, 0);
+    if (!er.ok) {
+        fprintf(stderr, "eval error: %s\n", er.error_message ? er.error_message : "unknown");
+        return 1;
+    }
+    printf("eval closure_hof() = ");
     value_fprint(stdout, &er.result);
     printf("\n");
     value_release(&er.result);

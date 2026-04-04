@@ -23,6 +23,7 @@ run: $(BIN)
 
 test: $(BIN)
 	./$(BIN) tests/smoke.mons
+	./$(BIN) tests/closure.mons
 	./$(BIN) --reflect tests/smoke.mons > /dev/null
 	./$(BIN) --vm-test
 

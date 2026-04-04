@@ -1,0 +1,7 @@
+// Parse + typecheck: lambdas and captures (evaluated in embedded demo / REPL).
+
+pub fn closure_ty_ok() -> int {
+    let x = 3;
+    let d = || x * 2;
+    d()
+}

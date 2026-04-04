@@ -404,6 +404,48 @@ static AstList *parse_param_list(Parser *p) {
     return params;
 }
 
+/* Parameters between `|` and closing `|`; each param is `[mut] IDENT [':' type]`. */
+static AstList *parse_lambda_params_until_pipe(Parser *p) {
+    AstList *params = NULL;
+
+    while (!check(p, TOK_PIPE) && !p->error) {
+        Token *t_param = peek(p);
+        bool is_mut = match(p, TOK_MUT);
+        const char *name = expect_ident_copy(p);
+        if (p->error || !name) {
+            return NULL;
+        }
+        AstNode *ty = NULL;
+        if (match(p, TOK_COLON)) {
+            ty = parse_type(p);
+            if (p->error || !ty) {
+                return NULL;
+            }
+        }
+
+        AstNode *param = ast_alloc(NODE_PARAM, tok_loc(p, t_param));
+        if (!param) {
+            parser_error(p, t_param, "out of memory");
+            return NULL;
+        }
+        AS_PARAM(param).name = name;
+        AS_PARAM(param).type = ty;
+        AS_PARAM(param).is_mut = is_mut;
+        AS_PARAM(param).is_self = false;
+        params = ast_list_append(params, param);
+
+        if (check(p, TOK_PIPE)) {
+            break;
+        }
+        if (!match(p, TOK_COMMA)) {
+            Token *tbad = peek(p);
+            parser_error(p, tbad ? tbad : t_param, "expected ',' or '|' after lambda parameter");
+            return NULL;
+        }
+    }
+    return params;
+}
+
 static AstNode *parse_block(Parser *p);
 
 static AstNode *parse_stmt(Parser *p);
@@ -1215,6 +1257,54 @@ static AstNode *parse_atom(Parser *p) {
         }
         AS_ARRAY(arr).elements = els;
         return parse_postfix(p, arr);
+    }
+
+    /* Lambda: `|| body` or `| params | [ -> ret ] body` (body = block or expr). */
+    if (t->kind == TOK_PIPE_PIPE || t->kind == TOK_PIPE) {
+        Token *t_start = t;
+        AstList *lam_params = NULL;
+
+        if (t->kind == TOK_PIPE_PIPE) {
+            p->i++;
+        } else {
+            p->i++;
+            lam_params = parse_lambda_params_until_pipe(p);
+            if (p->error) {
+                return NULL;
+            }
+            expect(p, TOK_PIPE, "closing '|' in lambda");
+            if (p->error) {
+                return NULL;
+            }
+        }
+
+        AstNode *ret_ann = NULL;
+        if (match(p, TOK_ARROW)) {
+            ret_ann = parse_type(p);
+            if (p->error || !ret_ann) {
+                return NULL;
+            }
+        }
+
+        AstNode *body;
+        if (check(p, TOK_LBRACE)) {
+            body = parse_block(p);
+        } else {
+            body = parse_expr(p);
+        }
+        if (p->error || !body) {
+            return NULL;
+        }
+
+        AstNode *lam = ast_alloc(NODE_LAMBDA, tok_loc(p, t_start));
+        if (!lam) {
+            parser_error(p, t_start, "out of memory");
+            return NULL;
+        }
+        AS_LAMBDA(lam).params = lam_params;
+        AS_LAMBDA(lam).ret_type = ret_ann;
+        AS_LAMBDA(lam).body = body;
+        return parse_postfix(p, lam);
     }
 
     parser_error(p, t, "expected expression");
