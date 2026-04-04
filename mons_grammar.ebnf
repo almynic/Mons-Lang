@@ -1,0 +1,248 @@
+(* ============================================================ *)
+(*  Mons Lang — Formal Grammar (EBNF)                          *)
+(*  Convention: terminals in "quotes", optionals in [...],     *)
+(*  repetition in {...}, alternation with |                    *)
+(* ============================================================ *)
+
+
+(* ── Top level ─────────────────────────────────────────────── *)
+
+program         = { top_level_decl } EOF ;
+
+top_level_decl  = fn_decl
+                | struct_decl
+                | trait_decl
+                | impl_decl
+                | macro_decl
+                | use_decl
+                | const_decl ;
+
+
+(* ── Use / imports ──────────────────────────────────────────── *)
+
+use_decl        = "use" module_path [ "::" "{" use_tree_list "}" ] ";" ;
+module_path     = IDENT { "::" IDENT } ;
+use_tree_list   = use_tree { "," use_tree } ;
+use_tree        = IDENT | "*" ;
+
+
+(* ── Constants ──────────────────────────────────────────────── *)
+
+const_decl      = [ "pub" ] "const" IDENT ":" type "=" expr ";" ;
+
+
+(* ── Functions ──────────────────────────────────────────────── *)
+
+fn_decl         = [ "pub" ] "fn" IDENT [ generic_params ] "(" [ param_list ] ")" [ "->" type ] block ;
+
+param_list      = param { "," param } ;
+param           = [ "mut" ] IDENT ":" type ;
+
+generic_params  = "[" generic_param { "," generic_param } "]" ;
+generic_param   = IDENT [ ":" trait_bound ] ;
+trait_bound     = IDENT { "+" IDENT } ;
+
+
+(* ── Structs ────────────────────────────────────────────────── *)
+
+struct_decl     = [ "pub" ] "struct" IDENT [ generic_params ] "{" { struct_field } "}" ;
+struct_field    = [ "pub" ] [ "mut" ] IDENT ":" type "," ;
+
+
+(* ── Traits ─────────────────────────────────────────────────── *)
+
+trait_decl      = [ "pub" ] "trait" IDENT [ generic_params ] [ ":" trait_bound ] "{"
+                    { trait_item }
+                  "}" ;
+
+trait_item      = fn_signature ";"        (* required method *)
+                | fn_decl ;               (* default method  *)
+
+fn_signature    = "fn" IDENT [ generic_params ] "(" [ param_list ] ")" [ "->" type ] ;
+
+
+(* ── Impl blocks ─────────────────────────────────────────────── *)
+
+impl_decl       = "impl" [ generic_params ] [ IDENT "for" ] IDENT [ generic_params ] "{"
+                    { fn_decl }
+                  "}" ;
+
+
+(* ── Macros ──────────────────────────────────────────────────── *)
+
+macro_decl      = "macro" IDENT "!" "(" macro_param_list ")" macro_body ;
+macro_param_list= { macro_param } ;
+macro_param     = "$" IDENT ":" macro_fragment ;
+macro_fragment  = "expr" | "stmt" | "ty" | "ident" | "block" | "tt" ;
+macro_body      = "{" { macro_rule } "}" ;
+macro_rule      = "(" macro_pattern ")" "=>" block ;
+macro_pattern   = { macro_token } ;
+macro_token     = "$" IDENT | TOKEN ;   (* TOKEN = any lexical token *)
+
+
+(* ── Types ───────────────────────────────────────────────────── *)
+
+type            = primitive_type
+                | named_type
+                | array_type
+                | fn_type
+                | option_type
+                | result_type
+                | tuple_type
+                | ref_type ;
+
+primitive_type  = "int" | "float" | "double" | "bool" | "string" ;
+named_type      = IDENT [ "[" type_arg_list "]" ] ;
+array_type      = "[" type "]" ;
+fn_type         = "fn" "(" [ type { "," type } ] ")" "->" type ;
+option_type     = "Option" "[" type "]" ;
+result_type     = "Result" "[" type "," type "]" ;
+tuple_type      = "(" type { "," type } ")" ;
+ref_type        = "&" [ "mut" ] type ;
+
+type_arg_list   = type { "," type } ;
+
+
+(* ── Statements ──────────────────────────────────────────────── *)
+
+stmt            = let_stmt
+                | return_stmt
+                | expr_stmt
+                | for_stmt
+                | try_stmt ;
+
+let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
+return_stmt     = "return" [ expr ] ";" ;
+expr_stmt       = expr ";" ;
+
+for_stmt        = "for" IDENT "in" expr block ;     (* iterator-based *)
+
+try_stmt        = "try" block
+                  { "catch" "(" IDENT ":" type ")" block }
+                  [ "finally" block ] ;
+
+
+(* ── Expressions ─────────────────────────────────────────────── *)
+(*  Precedence (low → high):                                      *)
+(*    assign, or, and, eq, cmp, add/sub, mul/div, unary, call    *)
+
+expr            = assign_expr ;
+
+assign_expr     = or_expr [ "=" assign_expr ] ;
+
+or_expr         = and_expr { "||" and_expr } ;
+and_expr        = eq_expr  { "&&" eq_expr  } ;
+
+eq_expr         = cmp_expr { ( "==" | "!=" ) cmp_expr } ;
+cmp_expr        = add_expr { ( "<" | ">" | "<=" | ">=" ) add_expr } ;
+
+add_expr        = mul_expr { ( "+" | "-" ) mul_expr } ;
+mul_expr        = unary_expr { ( "*" | "/" | "%" ) unary_expr } ;
+
+unary_expr      = ( "!" | "-" ) unary_expr
+                | postfix_expr ;
+
+postfix_expr    = primary_expr { postfix_op } ;
+postfix_op      = "." IDENT                             (* field access  *)
+                | "." IDENT "(" [ arg_list ] ")"        (* method call   *)
+                | "[" expr "]"                           (* index         *)
+                | "(" [ arg_list ] ")" ;                (* function call  *)
+
+primary_expr    = literal
+                | IDENT
+                | if_expr
+                | match_expr
+                | block_expr
+                | lambda_expr
+                | struct_init
+                | tuple_expr
+                | array_expr
+                | macro_call
+                | "(" expr ")" ;
+
+arg_list        = expr { "," expr } ;
+
+
+(* ── If / else ───────────────────────────────────────────────── *)
+
+if_expr         = "if" expr block { "else" "if" expr block } [ "else" block ] ;
+
+
+(* ── Match ───────────────────────────────────────────────────── *)
+
+match_expr      = "match" expr "{" { match_arm } "}" ;
+match_arm       = pattern [ "if" expr ] "=>" ( expr "," | block ) ;
+
+pattern         = "_"                                   (* wildcard      *)
+                | literal                               (* literal pat   *)
+                | IDENT                                 (* bind          *)
+                | IDENT "::" IDENT                      (* enum variant  *)
+                | IDENT "::" IDENT "(" [ pattern_list ] ")"
+                | struct_pattern
+                | tuple_pattern
+                | "[" [ pattern_list ] "]"              (* array pat     *)
+                | pattern "|" pattern ;                 (* or-pattern    *)
+
+pattern_list    = pattern { "," pattern } ;
+
+struct_pattern  = IDENT "{" { IDENT [ ":" pattern ] "," } [ ".." ] "}" ;
+tuple_pattern   = "(" pattern { "," pattern } ")" ;
+
+
+(* ── Lambdas / closures ──────────────────────────────────────── *)
+
+lambda_expr     = "|" [ lambda_param_list ] "|" [ "->" type ] ( expr | block ) ;
+lambda_param_list = lambda_param { "," lambda_param } ;
+lambda_param    = [ "mut" ] IDENT [ ":" type ] ;
+
+
+(* ── Struct initialisation ───────────────────────────────────── *)
+
+struct_init     = IDENT "{" { field_init } [ ".." expr ] "}" ;
+field_init      = IDENT ":" expr "," ;
+
+
+(* ── Block ───────────────────────────────────────────────────── *)
+
+block_expr      = block ;
+block           = "{" { stmt } [ expr ] "}" ;   (* last expr is return value *)
+
+
+(* ── Compound literals ───────────────────────────────────────── *)
+
+tuple_expr      = "(" expr "," { expr "," } ")" ;
+array_expr      = "[" [ expr { "," expr } ] "]" ;
+
+
+(* ── Macro invocation ────────────────────────────────────────── *)
+
+macro_call      = IDENT "!" "(" { TOKEN } ")"
+                | IDENT "!" "[" { TOKEN } "]"
+                | IDENT "!" "{" { TOKEN } "}" ;
+
+
+(* ── Literals ────────────────────────────────────────────────── *)
+
+literal         = INT_LIT
+                | FLOAT_LIT
+                | DOUBLE_LIT
+                | BOOL_LIT
+                | STRING_LIT
+                | "None" ;
+
+INT_LIT         = DIGIT { DIGIT } ;
+FLOAT_LIT       = DIGIT { DIGIT } "." DIGIT { DIGIT } "f" ;
+DOUBLE_LIT      = DIGIT { DIGIT } "." DIGIT { DIGIT } ;
+BOOL_LIT        = "true" | "false" ;
+STRING_LIT      = '"' { CHAR | ESCAPE } '"' ;
+ESCAPE          = "\\" ( "n" | "t" | "r" | "\\" | '"' | "0" ) ;
+
+
+(* ── Lexical terminals ───────────────────────────────────────── *)
+
+IDENT           = ALPHA { ALPHA | DIGIT | "_" } ;
+ALPHA           = "a".."z" | "A".."Z" | "_" ;
+DIGIT           = "0".."9" ;
+
+COMMENT         = "//" { ANY } NEWLINE
+                | "/*" { ANY } "*/" ;   (* both styles, comments ignored *)
