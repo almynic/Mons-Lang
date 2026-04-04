@@ -164,6 +164,11 @@ static void ast_print_node(const AstNode *n, int indent) {
                    AS_STRUCT_FIELD(n).name);
             ast_print_node(AS_STRUCT_FIELD(n).type, indent + 2);
             break;
+        case NODE_CONST_DECL:
+            printf("CONST %s%s\n", AS_CONST_DECL(n).is_pub ? "pub " : "", AS_CONST_DECL(n).name);
+            ast_print_node(AS_CONST_DECL(n).type, indent + 2);
+            ast_print_node(AS_CONST_DECL(n).value, indent + 2);
+            break;
         default:
             printf("(node kind %d)\n", (int)n->kind);
             break;
