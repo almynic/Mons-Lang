@@ -13,6 +13,7 @@
 #include "repl.h"
 #include "compile.h"
 #include "vm.h"
+#include "reflection.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,19 +100,53 @@ static char *read_file_contents(const char *path) {
     return buf;
 }
 
+/* Concatenate two sources for a single parse (stdlib prelude + user file). */
+static char *combine_file_contents(const char *first_path, const char *second_path) {
+    char *a = read_file_contents(first_path);
+    char *b = read_file_contents(second_path);
+    char *out;
+    size_t la;
+    size_t lb;
+
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return NULL;
+    }
+    la = strlen(a);
+    lb = strlen(b);
+    out = (char *)malloc(la + 2u + lb + 1u);
+    if (!out) {
+        free(a);
+        free(b);
+        return NULL;
+    }
+    memcpy(out, a, la);
+    out[la] = '\n';
+    out[la + 1u] = '\n';
+    memcpy(out + la + 2u, b, lb);
+    out[la + 2u + lb] = '\0';
+    free(a);
+    free(b);
+    return out;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [-i|--repl|--vm-test] [file.mons]\n"
-            "  no args       run embedded demo (AST + typecheck + eval)\n"
-            "  -i, --repl    interactive read-eval-print loop\n"
-            "  --vm-test     typecheck tests/smoke.mons, run smoke() via bytecode VM\n"
-            "  file.mons     lex, parse, and typecheck only\n",
+            "usage: %s [-i|--repl|--vm-test|--reflect] [file.mons]\n"
+            "  no args          run embedded demo (AST + typecheck + eval)\n"
+            "  -i, --repl       interactive read-eval-print loop\n"
+            "  --vm-test        typecheck stdlib+vm_smoke, run smoke() on bytecode VM\n"
+            "  --reflect FILE   print public API summary (after typecheck)\n"
+            "  file.mons        lex, parse, and typecheck only\n",
             argv0);
 }
 
 static int run_vm_smoke_test(void) {
-    const char *path = "tests/smoke.mons";
-    char *src = read_file_contents(path);
+    const char *prelude_path = "stdlib/core.mons";
+    const char *user_path = "tests/vm_smoke.mons";
+    const char *virt = "stdlib/core.mons+tests/vm_smoke.mons";
+    char *src = combine_file_contents(prelude_path, user_path);
     TokenArray tokens;
     ParseResult pr;
     TypeCheckResult tc;
@@ -120,18 +155,18 @@ static int run_vm_smoke_test(void) {
     int smoke_idx;
 
     if (!src) {
-        fprintf(stderr, "error: could not read \"%s\"\n", path);
+        fprintf(stderr, "error: could not read \"%s\" and/or \"%s\"\n", prelude_path, user_path);
         return 1;
     }
 
-    tokens = lexer_tokenize(src, path);
+    tokens = lexer_tokenize(src, virt);
     if (!tokens.items) {
         free(src);
         fprintf(stderr, "error: lexer failed\n");
         return 1;
     }
 
-    pr = parse_tokens(tokens, path);
+    pr = parse_tokens(tokens, virt);
     free(src);
     if (pr.error_message) {
         fprintf(stderr, "parse error at %u:%u: %s\n",
@@ -186,6 +221,53 @@ static int run_vm_smoke_test(void) {
     printf("\n");
     value_release(&vr.result);
     compile_program_result_free(&bc);
+    token_array_free(&tokens);
+    ast_free_all();
+    return 0;
+}
+
+static int run_reflect(const char *path) {
+    char *src = read_file_contents(path);
+    TokenArray tokens;
+    ParseResult pr;
+    TypeCheckResult tc;
+
+    if (!src) {
+        fprintf(stderr, "error: could not read \"%s\"\n", path);
+        return 1;
+    }
+
+    tokens = lexer_tokenize(src, path);
+    if (!tokens.items) {
+        free(src);
+        fprintf(stderr, "error: lexer failed\n");
+        return 1;
+    }
+
+    pr = parse_tokens(tokens, path);
+    free(src);
+    if (pr.error_message) {
+        fprintf(stderr, "parse error at %u:%u: %s\n",
+                pr.error_line,
+                pr.error_col,
+                pr.error_message);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    tc = type_check_program(pr.program);
+    if (!tc.ok) {
+        fprintf(stderr, "type error at %u:%u: %s\n",
+                tc.error_line,
+                tc.error_col,
+                tc.error_message);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    reflection_fprint_program(stdout, pr.program);
     token_array_free(&tokens);
     ast_free_all();
     return 0;
@@ -300,6 +382,15 @@ int main(int argc, char **argv) {
 
     if (argc >= 2 && strcmp(argv[1], "--vm-test") == 0) {
         return run_vm_smoke_test();
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--reflect") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "error: --reflect requires a file path\n");
+            usage(argv[0]);
+            return 1;
+        }
+        return run_reflect(argv[2]);
     }
 
     if (argc >= 2 && (strcmp(argv[1], "-i") == 0 || strcmp(argv[1], "--repl") == 0)) {

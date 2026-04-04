@@ -1,0 +1,8 @@
+// Consumed only by `./mons --vm-test` after stdlib/core.mons (concatenated).
+// `tests/smoke.mons` stays self-contained for plain typecheck.
+
+pub const K: int = 7;
+
+pub fn smoke() -> int {
+    twice(K)
+}

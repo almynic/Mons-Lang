@@ -333,6 +333,7 @@ Built-in generic types:
 | **Evaluator** | `eval.c` — tree-walk with environments, refcounted composite values (`[T]`, tuples, structs) |
 | **REPL + driver** | `repl.c`, `main.c` — `-i` / `--repl` (accumulated session, re-typecheck each input); no-arg demo; file path = typecheck only |
 | **Bytecode (2A/2B)** | `bytecode.c`, `compile.c`, `vm.c` — stack `Chunk`, `compile_program_bc`, `OP_CALL`, `vm_run_program`; `--vm-test` |
+| **Reflection + stdlib (2C)** | `reflection.c`, `stdlib/core.mons` — **`--reflect`** public API summary; VM smoke prepends stdlib + `tests/vm_smoke.mons` |
 
 **Language surface that typechecks and runs end-to-end** (non-exhaustive):
 
@@ -343,7 +344,7 @@ Built-in generic types:
 - **Struct literals** `Type { f: e, }`, **field access**, and **struct update** `Type { f: v, ..base, }` (spread must appear after explicit fields in the current parser).
 - **Arrays** and **tuples**: literals, indexing; tuple indices must be **integer literals** in the type checker.
 
-**Deferred (bytecode still catching up to Phase 1)** in this repo: `impl` / trait parsing, **`match`**, **lambdas**, **`try` / `catch` / `finally`** (parser rejects `try` today), AST **macro** expansion pass, **`stdlib/`**, bytecode for composites / `if` / `&&`/`||` / methods, tracing **GC** — see Phase 2B/2C in DESIGN. **Cross-function calls** on the VM are implemented (Phase 2B partial).
+**Deferred (bytecode still catching up to Phase 1)** in this repo: `impl` / trait parsing, **`match`**, **lambdas / closures** (grammar only; not parsed end-to-end), **`try` / `catch` / `finally`** (parser rejects `try` today), AST **macro** expansion pass, **`use` imports**, bytecode for composites / `if` / `&&`/`||` / methods, tracing **GC** — see DESIGN. **Cross-function calls** and a **stdlib prelude** for VM smoke are implemented; **`--reflect`** lists public API shapes from the AST.
 
 ---
 
@@ -363,7 +364,7 @@ Phase 1 — Tree-walk interpreter (complete)
 Phase 2 — Bytecode VM
   ✓ Phase 2A: stack bytecode + `Chunk`, compiler subset, stack VM, `./mons --vm-test`
   ◐ Phase 2B: **calls** (`compile_program_bc`, `OP_CALL`, `vm_run_program`); broader types, optional register machine, tracing GC still open
-  ○ Phase 2C: closures, reflection, stdlib
+  ✓ Phase 2C: **reflection** (`--reflect`), **stdlib** prelude (`stdlib/core.mons` + VM smoke); lambdas/closures deferred
 
 Phase 3 — Native code (optional)
   ▸ C code emission or LLVM IR backend
@@ -381,8 +382,11 @@ mons-lang/
 ├── LANGUAGE.md             # Syntax reference + Phase 1 examples
 ├── mons_grammar.ebnf       # Formal grammar (EBNF)
 ├── Makefile
+├── stdlib/
+│   └── core.mons           # Prepended for `./mons --vm-test`
 ├── tests/
-│   └── smoke.mons          # `make test` — parse + typecheck; VM smoke calls `bump(K)`
+│   ├── smoke.mons          # `make test` — parse + typecheck (`bump(K)`)
+│   └── vm_smoke.mons       # With stdlib: VM smoke (`twice(K)` → 14)
 │
 ├── include/
 │   ├── ast.h               # AST nodes, lists, arena API
@@ -393,7 +397,8 @@ mons-lang/
 │   ├── repl.h              # repl_run()
 │   ├── bytecode.h          # Chunk, opcodes
 │   ├── compile.h           # compile_program_bc, bc_fn_index, BcProgram
-│   └── vm.h                # vm_run_program, vm_run_chunk
+│   ├── vm.h                # vm_run_program, vm_run_chunk
+│   └── reflection.h        # reflection_fprint_program
 │
 └── src/
     ├── main.c              # CLI: demo | file typecheck | REPL (-i)
@@ -406,10 +411,11 @@ mons-lang/
     ├── bytecode.c          # Phase 2A: Chunk + constant pool
     ├── compile.c           # Phase 2A/2B: AST → bytecode (subset + calls)
     ├── vm.c                # Phase 2A/2B: stack VM + call frames
+    ├── reflection.c        # Phase 2C: public API dump
     └── ast_print.c         # Debug AST printer
 ```
 
-*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — Phase 2A stack + subset; Phase 2B multi-chunk calls. Later: `macro.c`, `stdlib/`, tracing GC — see DESIGN.)*
+*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — Phase 2A stack + subset; Phase 2B multi-chunk calls. Phase 2C: `reflection.c`, `stdlib/core.mons`. Later: `use`, lambdas, tracing GC — see DESIGN.)*
 
 ---
 
@@ -420,7 +426,7 @@ Requires a C11-compatible compiler. No other dependencies.
 ```sh
 cd mons-lang
 make
-make test           # typecheck tests/smoke.mons + bytecode VM smoke (`--vm-test`)
+make test           # typecheck smoke.mons + `--reflect` + bytecode VM smoke (`--vm-test`)
 ```
 
 ### `mons` modes
@@ -430,12 +436,13 @@ make test           # typecheck tests/smoke.mons + bytecode VM smoke (`--vm-test
 | *(no arguments)* | Embedded sample: print AST, typecheck, run several **`eval_call_by_name`** smoke tests (`add`, `mid`, …). |
 | **`./mons path.mons`** | Read file, lex, parse, typecheck. Prints `type check: ok` on success. No eval, no AST dump. |
 | **`./mons -i`** or **`./mons --repl`** | Interactive REPL: session grows with each successful input; full program is re-parsed and re-typechecked each time. Non–top-level snippets are wrapped in `fn __monsrepl_N() { … }` and evaluated; see [LANGUAGE.md — REPL](LANGUAGE.md#repl). |
-| **`./mons --vm-test`** | Typecheck `tests/smoke.mons`, bytecode-compile all top-level functions, run **`smoke`** via **`vm_run_program`** (cross-call `bump(K)`); prints `bytecode smoke() = 8`. |
+| **`./mons --vm-test`** | Concatenate **`stdlib/core.mons`** + **`tests/vm_smoke.mons`**, typecheck, bytecode-compile, run **`smoke`** via **`vm_run_program`** (call to **`twice`**); prints `bytecode smoke() = 14`. |
+| **`./mons --reflect path.mons`** | Lex, parse, typecheck, then print a line-oriented summary of **`pub struct`**, **`pub fn`**, **`pub const`** (for tooling). |
 | **`./mons -h`** / **`--help`** | Usage summary. |
 
 **REPL tips:** end a line with **`\\`** to continue on the next line, or leave **`{`** unclosed until the matching **`}`** (prompt shows `...`). Commands: **`:help`**, **`:clear`**, **`:quit`** (or EOF).
 
-**CI:** `make test` runs `./mons tests/smoke.mons` and `./mons --vm-test`; both must exit 0.
+**CI:** `make test` runs `./mons tests/smoke.mons`, `./mons --reflect tests/smoke.mons`, and `./mons --vm-test`; all must exit 0.
 
 ---
 

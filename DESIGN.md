@@ -500,22 +500,22 @@ Phase 2 replaces (or complements) the tree-walk interpreter with a compact bytec
 - **Bytecode** (`bytecode.h` / `bytecode.c`): opcodes, `Chunk` (code bytes + constant pool of `Value`).
 - **Compiler** (`compile.h` / `compile.c`): AST → bytecode for a **limited** surface: integer/bool literals, `+ - * / %`, comparisons on ints, unary `-`, locals (parameters + `let`), top-level **integer const** references (const initializer must be an int literal), blocks with tail expression, `return`, expression statements. **Not** compiled yet: `&&` / `||`, unary `!`, `if`, indirect/method calls, composites, floats, `for`, etc. (compiler reports an error).
 - **VM** (`vm.h` / `vm.c`): **stack** machine. Refcounting aligned with `eval.h` (`value_retain` / `value_release`). **`vm_run_chunk`** runs a single `Chunk` (no cross-chunk calls); see Phase 2B for multi-chunk execution.
-- **Driver**: `./mons --vm-test` typechecks `tests/smoke.mons`, compiles the program, runs entry `smoke` on the VM, prints the result (used from `make test`).
+- **Driver**: `./mons --vm-test` concatenates **`stdlib/core.mons`** + **`tests/vm_smoke.mons`**, typechecks, compiles, runs entry **`smoke`** on the VM (prints `bytecode smoke() = 14` for `twice(K)`). Plain **`tests/smoke.mons`** is still typechecked alone in `make test`.
 
 Rationale: a stack VM is quicker to land than a register allocator; the opcode layout can be retargeted to registers later without changing the language semantics.
 
 #### Phase 2B — Calls, richer types, register machine *(partially in tree)*
 
-- **Done:** **`compile_program_bc`**: every top-level `fn` in source order → `BcProgram` (`Chunk *chunks`, `nchunks`); **`bc_fn_index(program, name)`** for entry lookup. **`OP_CALL`** (callee chunk index + arity); callee must be a **named** function (`callee(args)` with `callee` an identifier). **`vm_run_program(chunks, nchunks, entry, args, nargs)`** with a **call stack** (saved `ip`, locals, chunk per frame). **`vm_run_chunk`** is `vm_run_program(chunk, 1, 0, …)`. `tests/smoke.mons` exercises a cross-function call (`smoke` → `bump`).
+- **Done:** **`compile_program_bc`**: every top-level `fn` in source order → `BcProgram` (`Chunk *chunks`, `nchunks`); **`bc_fn_index(program, name)`** for entry lookup. **`OP_CALL`** (callee chunk index + arity); callee must be a **named** function (`callee(args)` with `callee` an identifier). **`vm_run_program(chunks, nchunks, entry, args, nargs)`** with a **call stack** (saved `ip`, locals, chunk per frame). **`vm_run_chunk`** is `vm_run_program(chunk, 1, 0, …)`. `tests/smoke.mons` exercises a cross-function call (`smoke` → `bump`); **`--vm-test`** uses stdlib + `vm_smoke.mons` for a prelude + bytecode entry.
 - **Still open:** broader scalar/struct coverage on bytecode, optional **register-based** frame layout, **tri-color GC** where refcount is insufficient.
 
-#### Phase 2C — Closures, reflection, stdlib
+#### Phase 2C — Reflection, stdlib prelude, tooling *(in tree)*
 
-- **Upvalues** / closures for lambdas when they enter the parser.
-- **Reflection** metadata (types, fields) for tooling and stdlib.
-- **`stdlib/`** wired to bytecode entry points.
+- **Reflection** (`reflection.h` / `reflection.c`): **`reflection_fprint_program`** prints a line-oriented summary of **`pub struct`**, **`pub fn`** (params + return types from the AST), and **`pub const`** for downstream tooling. CLI: **`./mons --reflect file.mons`** (parse → typecheck → summary on stdout).
+- **Stdlib** (`stdlib/core.mons`): small **bytecode-safe** helpers (`twice`, `add`, …). **`--vm-test`** prepends this file to **`tests/vm_smoke.mons`** so the VM smoke exercises a **stdlib symbol** without a `use` system yet.
+- **Deferred (not Phase 2C in this repo):** **Lambdas / upvalues / closures** — `NODE_LAMBDA` and grammar exist as design targets; the parser does not build lambdas from source yet, and the type checker rejects them. A full **tracing GC** and **`use` imports** remain later work.
 
-**Milestone (full Phase 2):** Mons programs run significantly faster than the tree-walk path; GC and closures support the full language + stdlib end-to-end.
+**Milestone (full Phase 2, long-term):** Mons programs run significantly faster than the tree-walk path; GC and closures support the full language + stdlib end-to-end.
 
 ### Phase 3 — Native code (optional)
 
@@ -547,10 +547,14 @@ mons-lang/
 │   ├── repl.h              # repl_run()
 │   ├── bytecode.h          # Chunk, opcodes (Phase 2A)
 │   ├── compile.h           # compile_program_bc, BcProgram (2A subset + 2B multi-chunk)
-│   └── vm.h                # vm_run_program, vm_run_chunk (Phase 2A/2B)
+│   ├── vm.h                # vm_run_program, vm_run_chunk (Phase 2A/2B)
+│   └── reflection.h        # reflection_fprint_program (Phase 2C)
 │
+├── stdlib/
+│   └── core.mons           # Prelude for --vm-test (bytecode subset)
 ├── tests/
-│   └── smoke.mons          # `make test` + VM smoke (`bump(K)`)
+│   ├── smoke.mons          # `make test` typecheck; local `bump(K)`
+│   └── vm_smoke.mons       # Concat after stdlib for `--vm-test` only
 └── src/
     ├── arena.c             # Slab arena allocator
     ├── lexer.c             # Hand-written lexer
@@ -561,11 +565,12 @@ mons-lang/
     ├── bytecode.c          # Phase 2A: bytecode chunks
     ├── compile.c           # Phase 2A/2B: AST → bytecode (subset + calls)
     ├── vm.c                # Phase 2A/2B: stack VM + call frames
+    ├── reflection.c        # Phase 2C: public API summary for tooling
     ├── ast_print.c         # Debug AST printer
-    └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test)
+    └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test, --reflect)
 
-# Phase 2A/2B (in tree): bytecode.c, compile.c, vm.c — calls via OP_CALL + vm_run_program
-# Phase 2B/C+ remainder: register VM tuning, GC, closures, macro.c, stdlib/
+# Phase 2A–2C (in tree): bytecode, compile, vm, reflection; stdlib/core.mons prelude for VM smoke
+# Remainder: register VM tuning, tracing GC, lambdas/closures, use imports, macro.c, full stdlib
 ```
 
 ---

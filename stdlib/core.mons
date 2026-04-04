@@ -1,0 +1,10 @@
+// Stdlib core — prepended before VM smoke tests (see main.c --vm-test).
+// Keep functions within the bytecode subset (no if, &&, composites, …).
+
+pub fn twice(n: int) -> int {
+    n + n
+}
+
+pub fn add(a: int, b: int) -> int {
+    a + b
+}
