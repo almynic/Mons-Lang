@@ -321,7 +321,7 @@ Rough checklist for this repository’s lexer, parser, type checker, and tree-wa
 - Types: primitives, arrays, tuples, named structs, `Option` / `Result` in type syntax (limited in expressions).
 - Statements: **`let`**, **`return`**, expression statements, **`for x in expr`** (arrays at runtime).
 - Expressions: literals, **`if`**, blocks, operators above, assignment to locals, calls, **method calls** as desugared top-level `fn`, struct literals, **`..base`**, arrays/tuples and indexing.
-- Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; no-arg driver runs the embedded eval demo.
+- Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; **`./mons --vm-test`** runs `tests/smoke.mons` through the bytecode VM (**`compile_program_bc`** + **`vm_run_program`**, including a cross-function call in `smoke`); no-arg driver runs the embedded eval demo.
 - **Not** fully wired or rejected: `impl` / traits as runnable features, **`match`**, **lambdas**, **`try` / `catch`**, macros expansion, `use`, and much of the full EBNF surface.
 
 When in doubt, compare with [mons_grammar.ebnf](mons_grammar.ebnf) and the “implemented today” table in [README.md](README.md).

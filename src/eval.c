@@ -68,7 +68,7 @@ static Value val_bool(bool b) {
 }
 
 /* Bump refcount for shared composite payloads; primitives unchanged. */
-static Value value_retain(Value v) {
+Value value_retain(Value v) {
     if ((v.kind == VAL_ARRAY || v.kind == VAL_TUPLE) && v.as.seq) {
         v.as.seq->refc++;
     } else if (v.kind == VAL_STRUCT && v.as.st) {

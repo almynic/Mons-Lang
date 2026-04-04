@@ -491,20 +491,31 @@ Build order:
 
 **Beyond Phase 1 (design-doc parity, later phases):** closures/lambdas, `match`, `try`/`catch`, `impl` blocks and traits in the parser, generics on functions/structs, AST macros, and a standard library.
 
-### Phase 2 — Register-based bytecode VM
+### Phase 2 — Bytecode VM (staged)
 
-The bytecode phase introduces a proper execution engine. The AST is compiled to a compact instruction set; the VM executes bytecode rather than walking the tree.
+Phase 2 replaces (or complements) the tree-walk interpreter with a compact bytecode format and a dedicated execution loop. Work is split so each milestone stays shippable.
 
-Components:
+#### Phase 2A — Stack bytecode + compiler subset *(in tree)*
 
-- Bytecode format and instruction set definition
-- `compiler.c` — AST → bytecode compiler
-- `vm.c` — register-based VM execution loop
-- Garbage collector (tri-color mark-and-sweep)
-- Closure and upvalue representation
-- Reflection system (runtime type metadata)
+- **Bytecode** (`bytecode.h` / `bytecode.c`): opcodes, `Chunk` (code bytes + constant pool of `Value`).
+- **Compiler** (`compile.h` / `compile.c`): AST → bytecode for a **limited** surface: integer/bool literals, `+ - * / %`, comparisons on ints, unary `-`, locals (parameters + `let`), top-level **integer const** references (const initializer must be an int literal), blocks with tail expression, `return`, expression statements. **Not** compiled yet: `&&` / `||`, unary `!`, `if`, indirect/method calls, composites, floats, `for`, etc. (compiler reports an error).
+- **VM** (`vm.h` / `vm.c`): **stack** machine. Refcounting aligned with `eval.h` (`value_retain` / `value_release`). **`vm_run_chunk`** runs a single `Chunk` (no cross-chunk calls); see Phase 2B for multi-chunk execution.
+- **Driver**: `./mons --vm-test` typechecks `tests/smoke.mons`, compiles the program, runs entry `smoke` on the VM, prints the result (used from `make test`).
 
-Milestone: Mons programs run significantly faster. The GC handles heap-allocated values correctly. Closures, higher-order functions, and the full stdlib work end-to-end.
+Rationale: a stack VM is quicker to land than a register allocator; the opcode layout can be retargeted to registers later without changing the language semantics.
+
+#### Phase 2B — Calls, richer types, register machine *(partially in tree)*
+
+- **Done:** **`compile_program_bc`**: every top-level `fn` in source order → `BcProgram` (`Chunk *chunks`, `nchunks`); **`bc_fn_index(program, name)`** for entry lookup. **`OP_CALL`** (callee chunk index + arity); callee must be a **named** function (`callee(args)` with `callee` an identifier). **`vm_run_program(chunks, nchunks, entry, args, nargs)`** with a **call stack** (saved `ip`, locals, chunk per frame). **`vm_run_chunk`** is `vm_run_program(chunk, 1, 0, …)`. `tests/smoke.mons` exercises a cross-function call (`smoke` → `bump`).
+- **Still open:** broader scalar/struct coverage on bytecode, optional **register-based** frame layout, **tri-color GC** where refcount is insufficient.
+
+#### Phase 2C — Closures, reflection, stdlib
+
+- **Upvalues** / closures for lambdas when they enter the parser.
+- **Reflection** metadata (types, fields) for tooling and stdlib.
+- **`stdlib/`** wired to bytecode entry points.
+
+**Milestone (full Phase 2):** Mons programs run significantly faster than the tree-walk path; GC and closures support the full language + stdlib end-to-end.
 
 ### Phase 3 — Native code (optional)
 
@@ -532,11 +543,14 @@ mons-lang/
 │   ├── lexer.h
 │   ├── parser.h
 │   ├── types.h             # type_check_program
-│   ├── eval.h              # Value, eval_call_by_name, value_release
-│   └── repl.h              # repl_run()
+│   ├── eval.h              # Value, eval_call_by_name, value_retain, value_release
+│   ├── repl.h              # repl_run()
+│   ├── bytecode.h          # Chunk, opcodes (Phase 2A)
+│   ├── compile.h           # compile_program_bc, BcProgram (2A subset + 2B multi-chunk)
+│   └── vm.h                # vm_run_program, vm_run_chunk (Phase 2A/2B)
 │
 ├── tests/
-│   └── smoke.mons          # `make test`
+│   └── smoke.mons          # `make test` + VM smoke (`bump(K)`)
 └── src/
     ├── arena.c             # Slab arena allocator
     ├── lexer.c             # Hand-written lexer
@@ -544,11 +558,14 @@ mons-lang/
     ├── types.c             # Type checker + HM-style unification (Phase 1 subset)
     ├── eval.c              # Tree-walk interpreter (Phase 1)
     ├── repl.c              # Interactive REPL (-i / --repl)
+    ├── bytecode.c          # Phase 2A: bytecode chunks
+    ├── compile.c           # Phase 2A/2B: AST → bytecode (subset + calls)
+    ├── vm.c                # Phase 2A/2B: stack VM + call frames
     ├── ast_print.c         # Debug AST printer
-    └── main.c              # Pipeline entry (embedded demo, file path, or REPL)
+    └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test)
 
-# Phase 2+ (not in tree yet):
-#   macro.c, compiler.c, vm.c, stdlib/
+# Phase 2A/2B (in tree): bytecode.c, compile.c, vm.c — calls via OP_CALL + vm_run_program
+# Phase 2B/C+ remainder: register VM tuning, GC, closures, macro.c, stdlib/
 ```
 
 ---
@@ -621,6 +638,11 @@ Constants are type-checked with the same `infer_expr` pass as the rest of the pr
 
 **REPL semantics.**
 The REPL appends each submission to a session string and re-parses the **entire** program. If parsing as top-level declarations fails, the submission is wrapped in `fn __monsrepl_N() { … }` and re-parsed so statements and tail expressions behave like inside a normal function body. This avoids a second parser for “expression-only” input while keeping the type checker unchanged.
+
+---
+
+**Stack VM before registers.**
+The bytecode backend uses a **stack machine** (`vm.c`) so the compiler (`compile.c`) does not need a register allocator. **Phase 2B** adds **framed execution** and **`OP_CALL`** across chunks; a register-based VM remains an optional Phase 2B/C target for hot paths. Opcodes and `Chunk` layout are internal to the repo.
 
 ---
 

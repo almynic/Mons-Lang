@@ -11,6 +11,8 @@
 #include "parser.h"
 #include "types.h"
 #include "repl.h"
+#include "compile.h"
+#include "vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,11 +101,94 @@ static char *read_file_contents(const char *path) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [-i|--repl] [file.mons]\n"
-            "  no args      run embedded demo (AST + typecheck + eval)\n"
-            "  -i, --repl   interactive read-eval-print loop\n"
-            "  file.mons    lex, parse, and typecheck only\n",
+            "usage: %s [-i|--repl|--vm-test] [file.mons]\n"
+            "  no args       run embedded demo (AST + typecheck + eval)\n"
+            "  -i, --repl    interactive read-eval-print loop\n"
+            "  --vm-test     typecheck tests/smoke.mons, run smoke() via bytecode VM\n"
+            "  file.mons     lex, parse, and typecheck only\n",
             argv0);
+}
+
+static int run_vm_smoke_test(void) {
+    const char *path = "tests/smoke.mons";
+    char *src = read_file_contents(path);
+    TokenArray tokens;
+    ParseResult pr;
+    TypeCheckResult tc;
+    CompileProgramResult bc;
+    VmResult vr;
+    int smoke_idx;
+
+    if (!src) {
+        fprintf(stderr, "error: could not read \"%s\"\n", path);
+        return 1;
+    }
+
+    tokens = lexer_tokenize(src, path);
+    if (!tokens.items) {
+        free(src);
+        fprintf(stderr, "error: lexer failed\n");
+        return 1;
+    }
+
+    pr = parse_tokens(tokens, path);
+    free(src);
+    if (pr.error_message) {
+        fprintf(stderr, "parse error at %u:%u: %s\n",
+                pr.error_line,
+                pr.error_col,
+                pr.error_message);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    tc = type_check_program(pr.program);
+    if (!tc.ok) {
+        fprintf(stderr, "type error at %u:%u: %s\n",
+                tc.error_line,
+                tc.error_col,
+                tc.error_message);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    bc = compile_program_bc(pr.program);
+    if (!bc.ok) {
+        fprintf(stderr, "compile error: %s\n", bc.error_message ? bc.error_message : "unknown");
+        compile_program_result_free(&bc);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    smoke_idx = bc_fn_index(pr.program, "smoke");
+    if (smoke_idx < 0) {
+        fprintf(stderr, "compile error: no function \"smoke\"\n");
+        compile_program_result_free(&bc);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    vr = vm_run_program(bc.prog.chunks, bc.prog.nchunks, (size_t)smoke_idx, NULL, 0);
+    if (!vr.ok) {
+        fprintf(stderr, "vm error: %s\n", vr.error_message ? vr.error_message : "unknown");
+        compile_program_result_free(&bc);
+        token_array_free(&tokens);
+        ast_free_all();
+        return 1;
+    }
+
+    printf("bytecode smoke() = ");
+    value_fprint(stdout, &vr.result);
+    printf("\n");
+    value_release(&vr.result);
+    compile_program_result_free(&bc);
+    token_array_free(&tokens);
+    ast_free_all();
+    return 0;
 }
 
 static int run_demo_evals(AstNode *program) {
@@ -211,6 +296,10 @@ int main(int argc, char **argv) {
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
         usage(argv[0]);
         return 0;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "--vm-test") == 0) {
+        return run_vm_smoke_test();
     }
 
     if (argc >= 2 && (strcmp(argv[1], "-i") == 0 || strcmp(argv[1], "--repl") == 0)) {

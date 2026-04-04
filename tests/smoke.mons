@@ -1,7 +1,11 @@
-// Phase 1 smoke test: parse + typecheck (run via `make test`)
+// Phase 1 smoke: parse + typecheck; Phase 2 VM: cross-function call via bump(K)
 
 pub const K: int = 7;
 
+fn bump(n: int) -> int {
+    n + 1
+}
+
 pub fn smoke() -> int {
-    K + 1
+    bump(K)
 }

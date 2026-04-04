@@ -61,6 +61,7 @@ typedef struct {
 } EvalResult;
 
 void value_fprint(FILE *fp, const Value *v);
+Value value_retain(Value v);
 void value_release(Value *v);
 
 /* Run a type-checked top-level function by name. `args` length must match parameters. */
