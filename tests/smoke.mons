@@ -1,0 +1,7 @@
+// Phase 1 smoke test: parse + typecheck (run via `make test`)
+
+pub const K: int = 7;
+
+pub fn smoke() -> int {
+    K + 1
+}

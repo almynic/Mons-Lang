@@ -1,6 +1,8 @@
 /*
- * Demo driver: tokenize → parse → print AST → type_check_program → eval_call_by_name
- * for a few public functions.
+ * Driver: lex → parse → typecheck; optional AST print and eval smoke tests.
+ *
+ * With no arguments: embedded sample, print AST, typecheck, evaluate several pub fns.
+ * With a file path: read source, typecheck only (no AST dump, no eval) — for CI and `make test`.
  */
 #include "ast.h"
 #include "eval.h"
@@ -9,6 +11,8 @@
 #include "types.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static const char *embedded_sample =
     "struct Point {\n"
@@ -57,6 +61,47 @@ static const char *embedded_sample =
     "    let q = Point { x: 10, ..p, };\n"
     "    q.x + q.y\n"
     "}\n";
+
+static char *read_file_contents(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    long sz;
+    char *buf;
+
+    if (!fp) {
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    sz = ftell(fp);
+    if (sz < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    buf = (char *)malloc((size_t)sz + 1u);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    if (sz > 0 && fread(buf, 1u, (size_t)sz, fp) != (size_t)sz) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    buf[sz] = '\0';
+    return buf;
+}
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+            "usage: %s [file.mons]\n"
+            "  no args   run embedded demo (AST + typecheck + eval)\n"
+            "  file.mons lex, parse, and typecheck only\n",
+            argv0);
+}
 
 static int run_demo_evals(AstNode *program) {
     Value call_args[2];
@@ -150,45 +195,77 @@ static int run_demo_evals(AstNode *program) {
     return 0;
 }
 
-int main(void) {
-    TokenArray tokens = lexer_tokenize(embedded_sample, "<sample>");
-    if (!tokens.items) {
-        fprintf(stderr, "error: lexer failed to allocate token buffer\n");
-        return 1;
+int main(int argc, char **argv) {
+    char *file_buf = NULL;
+    const char *source;
+    const char *fname;
+    int demo_mode;
+    TokenArray tokens;
+    ParseResult pr;
+    TypeCheckResult tc;
+    int rc = 1;
+
+    if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        usage(argv[0]);
+        return 0;
     }
 
-    ParseResult pr = parse_tokens(tokens, "<sample>");
+    if (argc >= 2) {
+        file_buf = read_file_contents(argv[1]);
+        if (!file_buf) {
+            fprintf(stderr, "error: could not read \"%s\"\n", argv[1]);
+            return 1;
+        }
+        source = file_buf;
+        fname = argv[1];
+        demo_mode = 0;
+    } else {
+        source = embedded_sample;
+        fname = "<sample>";
+        demo_mode = 1;
+    }
+
+    tokens = lexer_tokenize(source, fname);
+    if (!tokens.items) {
+        fprintf(stderr, "error: lexer failed to allocate token buffer\n");
+        goto done;
+    }
+
+    pr = parse_tokens(tokens, fname);
     if (pr.error_message) {
         fprintf(stderr, "parse error at %u:%u: %s\n",
                 pr.error_line,
                 pr.error_col,
                 pr.error_message);
-        token_array_free(&tokens);
-        ast_free_all();
-        return 1;
+        goto done_tokens;
     }
 
-    ast_print(pr.program, 0);
+    if (demo_mode) {
+        ast_print(pr.program, 0);
+    }
 
-    TypeCheckResult tc = type_check_program(pr.program);
+    tc = type_check_program(pr.program);
     if (!tc.ok) {
         fprintf(stderr, "type error at %u:%u: %s\n",
                 tc.error_line,
                 tc.error_col,
                 tc.error_message);
-        token_array_free(&tokens);
-        ast_free_all();
-        return 1;
+        goto done_tokens;
     }
     printf("type check: ok\n");
 
-    if (run_demo_evals(pr.program) != 0) {
-        token_array_free(&tokens);
-        ast_free_all();
-        return 1;
+    if (demo_mode) {
+        if (run_demo_evals(pr.program) != 0) {
+            goto done_tokens;
+        }
     }
 
+    rc = 0;
+
+done_tokens:
     token_array_free(&tokens);
     ast_free_all();
-    return 0;
+done:
+    free(file_buf);
+    return rc;
 }

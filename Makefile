@@ -6,7 +6,7 @@ SRC := src/main.c src/lexer.c src/parser.c src/arena.c src/ast_print.c src/types
 OBJ := $(SRC:.c=.o)
 BIN := mons
 
-.PHONY: all run clean
+.PHONY: all run clean test
 
 all: $(BIN)
 
@@ -18,6 +18,9 @@ src/%.o: src/%.c include/ast.h include/lexer.h include/parser.h include/types.h 
 
 run: $(BIN)
 	./$(BIN)
+
+test: $(BIN)
+	./$(BIN) tests/smoke.mons
 
 clean:
 	rm -f $(OBJ) $(BIN)
