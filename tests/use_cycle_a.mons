@@ -1,0 +1,5 @@
+use tests::use_cycle_b;
+
+pub fn cycle_a() -> int {
+    1
+}

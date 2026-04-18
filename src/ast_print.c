@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 static void ast_print_node(const AstNode *n, int indent);
+static void ast_print_pattern(const AstNode *n, int indent);
 
 static void print_indent(int indent) {
     int i;
@@ -16,6 +17,57 @@ static void print_list(const AstList *list, int indent, void (*fn)(const AstNode
     const AstList *l;
     for (l = list; l; l = l->next) {
         fn(l->item, indent);
+    }
+}
+
+static void ast_print_pattern(const AstNode *n, int indent) {
+    if (!n) {
+        print_indent(indent);
+        printf("(null pat)\n");
+        return;
+    }
+    print_indent(indent);
+    switch (n->kind) {
+        case NODE_PAT_WILDCARD:
+            printf("PAT_WILDCARD\n");
+            break;
+        case NODE_PAT_LITERAL:
+            printf("PAT_LITERAL\n");
+            ast_print_node(AS_PAT_LIT(n).lit, indent + 2);
+            break;
+        case NODE_PAT_BIND:
+            printf("PAT_BIND %s%s\n", AS_PAT_BIND(n).is_mut ? "mut " : "", AS_PAT_BIND(n).name);
+            break;
+        case NODE_PAT_ENUM:
+            printf("PAT_ENUM %s::%s\n", AS_PAT_ENUM(n).type_name, AS_PAT_ENUM(n).variant);
+            print_list(AS_PAT_ENUM(n).fields, indent + 2, ast_print_pattern);
+            break;
+        case NODE_PAT_STRUCT:
+            printf("PAT_STRUCT %s\n", AS_PAT_STRUCT(n).name);
+            print_list(AS_PAT_STRUCT(n).field_pats, indent + 2, ast_print_pattern);
+            break;
+        case NODE_PAT_TUPLE:
+            printf("PAT_TUPLE\n");
+            print_list(AS_PAT_TUPLE(n).elements, indent + 2, ast_print_pattern);
+            break;
+        case NODE_PAT_ARRAY:
+            printf("PAT_ARRAY\n");
+            print_list(AS_PAT_ARRAY(n).elements, indent + 2, ast_print_pattern);
+            break;
+        case NODE_PAT_OR:
+            printf("PAT_OR\n");
+            ast_print_pattern(AS_PAT_OR(n).left, indent + 2);
+            ast_print_pattern(AS_PAT_OR(n).right, indent + 2);
+            break;
+        case NODE_PAT_FIELD:
+            printf("PAT_FIELD %s\n", AS_PAT_FIELD(n).field);
+            if (AS_PAT_FIELD(n).pattern) {
+                ast_print_pattern(AS_PAT_FIELD(n).pattern, indent + 2);
+            }
+            break;
+        default:
+            printf("(pattern kind %d)\n", (int)n->kind);
+            break;
     }
 }
 
@@ -74,6 +126,30 @@ static void ast_print_node(const AstNode *n, int indent) {
             if (AS_RETURN(n).value) {
                 ast_print_node(AS_RETURN(n).value, indent + 2);
             }
+            break;
+        case NODE_FOR:
+            printf("FOR %s\n", AS_FOR(n).var);
+            ast_print_node(AS_FOR(n).iter, indent + 2);
+            ast_print_node(AS_FOR(n).body, indent + 2);
+            break;
+        case NODE_TRY:
+            printf("TRY\n");
+            ast_print_node(AS_TRY(n).body, indent + 2);
+            print_list(AS_TRY(n).catch_clauses, indent + 2, ast_print_node);
+            if (AS_TRY(n).finally_body) {
+                print_indent(indent + 2);
+                printf("FINALLY\n");
+                ast_print_node(AS_TRY(n).finally_body, indent + 4);
+            }
+            break;
+        case NODE_CATCH_CLAUSE:
+            printf("CATCH %s\n", AS_CATCH(n).var);
+            ast_print_node(AS_CATCH(n).type, indent + 2);
+            ast_print_node(AS_CATCH(n).body, indent + 2);
+            break;
+        case NODE_THROW:
+            printf("THROW\n");
+            ast_print_node(AS_THROW(n).expr, indent + 2);
             break;
         case NODE_BINARY: {
             const char *op = "?";
@@ -158,6 +234,21 @@ static void ast_print_node(const AstNode *n, int indent) {
                 ast_print_node(AS_IF(n).else_body, indent + 4);
             }
             break;
+        case NODE_MATCH:
+            printf("MATCH\n");
+            ast_print_node(AS_MATCH(n).subject, indent + 2);
+            print_list(AS_MATCH(n).arms, indent + 2, ast_print_node);
+            break;
+        case NODE_MATCH_ARM:
+            printf("MATCH_ARM\n");
+            ast_print_pattern(AS_MATCH_ARM(n).pattern, indent + 2);
+            if (AS_MATCH_ARM(n).guard) {
+                print_indent(indent + 2);
+                printf("GUARD\n");
+                ast_print_node(AS_MATCH_ARM(n).guard, indent + 4);
+            }
+            ast_print_node(AS_MATCH_ARM(n).body, indent + 2);
+            break;
         case NODE_STRUCT_DECL:
             printf("STRUCT %s%s\n", AS_STRUCT_DECL(n).is_pub ? "pub " : "", AS_STRUCT_DECL(n).name);
             print_list(AS_STRUCT_DECL(n).fields, indent + 2, ast_print_node);
@@ -181,6 +272,19 @@ static void ast_print_node(const AstNode *n, int indent) {
                        AS_IMPL_DECL(n).struct_name);
             }
             print_list(AS_IMPL_DECL(n).methods, indent + 2, ast_print_node);
+            break;
+        case NODE_TRAIT_DECL:
+            printf("TRAIT %s%s\n", AS_TRAIT_DECL(n).is_pub ? "pub " : "", AS_TRAIT_DECL(n).name);
+            print_list(AS_TRAIT_DECL(n).items, indent + 2, ast_print_node);
+            break;
+        case NODE_TRAIT_FN_SIG:
+            printf("TRAIT_FN_SIG %s\n", AS_TRAIT_FN_SIG(n).name);
+            print_list(AS_TRAIT_FN_SIG(n).params, indent + 2, ast_print_node);
+            if (AS_TRAIT_FN_SIG(n).ret_type) {
+                print_indent(indent + 2);
+                printf("RET\n");
+                ast_print_node(AS_TRAIT_FN_SIG(n).ret_type, indent + 4);
+            }
             break;
         case NODE_CONST_DECL:
             printf("CONST %s%s\n", AS_CONST_DECL(n).is_pub ? "pub " : "", AS_CONST_DECL(n).name);

@@ -76,6 +76,11 @@ typedef struct {
 void value_fprint(FILE *fp, const Value *v);
 Value value_retain(Value v);
 void value_release(Value *v);
+ValSeq *value_seq_new(void);
+ValStruct *value_struct_new(void);
+ValClosure *value_closure_new(void);
+void value_gc_collect(const Value *roots, size_t nroots);
+size_t value_gc_live_count(void);
 
 /* Run a type-checked top-level function by name. `args` length must match parameters. */
 EvalResult eval_call_by_name(AstNode *program, const char *fn_name, const Value *args, size_t nargs);

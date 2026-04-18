@@ -1,0 +1,6 @@
+// `make test` — stdlib loads through the real `use` resolver (not concatenation).
+use stdlib::core;
+
+pub fn stdlib_wire() -> int {
+    add(abs_i(-5), max_int(2, 9))
+}

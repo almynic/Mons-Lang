@@ -1,0 +1,5 @@
+use no::such::module;
+
+pub fn should_fail_import() -> int {
+    1
+}

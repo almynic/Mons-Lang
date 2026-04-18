@@ -83,6 +83,7 @@ typedef struct Checker {
     Env *global_env;
     Env *current_env;
     Type *expected_return;
+    int catch_try_depth; /* >0 inside try { … } that has ≥1 catch; governs `throw` */
     const char *error;
     uint32_t err_line;
     uint32_t err_col;
@@ -769,6 +770,420 @@ static Type *infer_if_expr(Checker *c, AstNode *n) {
     return acc ? acc : ty_void;
 }
 
+static Type *struct_field_type(Type *st, const char *fname, size_t *out_index);
+
+static bool pat_has_wildcard(AstNode *pat) {
+    if (!pat) {
+        return false;
+    }
+    if (pat->kind == NODE_PAT_WILDCARD) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_OR) {
+        return pat_has_wildcard(AS_PAT_OR(pat).left) || pat_has_wildcard(AS_PAT_OR(pat).right);
+    }
+    return false;
+}
+
+static bool pat_covers_bool_true(AstNode *pat) {
+    if (!pat) {
+        return false;
+    }
+    if (pat->kind == NODE_PAT_WILDCARD || pat->kind == NODE_PAT_BIND) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_LITERAL && AS_PAT_LIT(pat).lit &&
+        AS_PAT_LIT(pat).lit->kind == NODE_LIT_BOOL && AS_LIT_BOOL(AS_PAT_LIT(pat).lit).value) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_OR) {
+        return pat_covers_bool_true(AS_PAT_OR(pat).left) || pat_covers_bool_true(AS_PAT_OR(pat).right);
+    }
+    return false;
+}
+
+static bool pat_covers_bool_false(AstNode *pat) {
+    if (!pat) {
+        return false;
+    }
+    if (pat->kind == NODE_PAT_WILDCARD || pat->kind == NODE_PAT_BIND) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_LITERAL && AS_PAT_LIT(pat).lit &&
+        AS_PAT_LIT(pat).lit->kind == NODE_LIT_BOOL && !AS_LIT_BOOL(AS_PAT_LIT(pat).lit).value) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_OR) {
+        return pat_covers_bool_false(AS_PAT_OR(pat).left) || pat_covers_bool_false(AS_PAT_OR(pat).right);
+    }
+    return false;
+}
+
+static bool pat_covers_none(AstNode *pat) {
+    if (!pat) {
+        return false;
+    }
+    if (pat->kind == NODE_PAT_WILDCARD || pat->kind == NODE_PAT_BIND) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_LITERAL && AS_PAT_LIT(pat).lit && AS_PAT_LIT(pat).lit->kind == NODE_LIT_NONE) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_ENUM && strcmp(AS_PAT_ENUM(pat).variant, "None") == 0) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_OR) {
+        return pat_covers_none(AS_PAT_OR(pat).left) || pat_covers_none(AS_PAT_OR(pat).right);
+    }
+    return false;
+}
+
+static bool pat_covers_some(AstNode *pat) {
+    if (!pat) {
+        return false;
+    }
+    if (pat->kind == NODE_PAT_WILDCARD || pat->kind == NODE_PAT_BIND) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_ENUM && strcmp(AS_PAT_ENUM(pat).variant, "Some") == 0) {
+        return true;
+    }
+    if (pat->kind == NODE_PAT_OR) {
+        return pat_covers_some(AS_PAT_OR(pat).left) || pat_covers_some(AS_PAT_OR(pat).right);
+    }
+    return false;
+}
+
+static bool match_exhaustive_for_type(Checker *c, Type *sty, AstList *arms, SrcLoc loc) {
+    AstList *a;
+    bool wild = false;
+    bool ctrue = false;
+    bool cfalse = false;
+    bool cnone = false;
+    bool csome = false;
+
+    sty = prune(sty);
+    if (!sty) {
+        checker_fail(c, loc, "internal: null match subject type");
+        return false;
+    }
+
+    for (a = arms; a; a = a->next) {
+        AstNode *arm = a->item;
+        AstNode *pat;
+        if (!arm || arm->kind != NODE_MATCH_ARM) {
+            continue;
+        }
+        pat = AS_MATCH_ARM(arm).pattern;
+        if (pat_has_wildcard(pat)) {
+            wild = true;
+        }
+        ctrue |= pat_covers_bool_true(pat);
+        cfalse |= pat_covers_bool_false(pat);
+        cnone |= pat_covers_none(pat);
+        csome |= pat_covers_some(pat);
+    }
+
+    if (wild) {
+        return true;
+    }
+    if (sty->kind == TY_BOOL) {
+        if (ctrue && cfalse) {
+            return true;
+        }
+        checker_fail(c, loc, "non-exhaustive match on bool (need `_` or both true and false)");
+        return false;
+    }
+    if (sty->kind == TY_OPTION) {
+        if (cnone && csome) {
+            return true;
+        }
+        checker_fail(c, loc, "non-exhaustive match on Option (need `_` or both None and Some arms)");
+        return false;
+    }
+    if (sty->kind == TY_INT || sty->kind == TY_FLOAT || sty->kind == TY_DOUBLE || sty->kind == TY_STRING) {
+        for (a = arms; a; a = a->next) {
+            AstNode *arm = a->item;
+            if (arm && arm->kind == NODE_MATCH_ARM &&
+                AS_MATCH_ARM(arm).pattern && AS_MATCH_ARM(arm).pattern->kind == NODE_PAT_BIND) {
+                return true;
+            }
+        }
+        checker_fail(c, loc, "non-exhaustive match on scalar (use a binding pattern like `x` or `_`)");
+        return false;
+    }
+    if (sty->kind == TY_STRUCT) {
+        checker_fail(c, loc, "match on struct requires a wildcard `_` arm for now");
+        return false;
+    }
+    checker_fail(c, loc, "match on this type requires a wildcard `_` arm");
+    return false;
+}
+
+static bool check_pat_shape(Checker *c, Type *subj, AstNode *pat, SrcLoc loc) {
+    Type *s;
+
+    if (!pat) {
+        checker_fail(c, loc, "internal: null pattern");
+        return false;
+    }
+    s = prune(subj);
+    switch (pat->kind) {
+        case NODE_PAT_WILDCARD:
+            return true;
+        case NODE_PAT_BIND:
+            return true;
+        case NODE_PAT_OR:
+            return check_pat_shape(c, subj, AS_PAT_OR(pat).left, loc) &&
+                   check_pat_shape(c, subj, AS_PAT_OR(pat).right, loc);
+        case NODE_PAT_LITERAL:
+            {
+                Type *lt = infer_expr(c, AS_PAT_LIT(pat).lit);
+                if (c->error) {
+                    return false;
+                }
+                return unify(c, lt, s, loc);
+            }
+        case NODE_PAT_ENUM:
+            {
+                const char *tn = AS_PAT_ENUM(pat).type_name;
+                const char *vn = AS_PAT_ENUM(pat).variant;
+                AstList *fl = AS_PAT_ENUM(pat).fields;
+                if (!s) {
+                    return false;
+                }
+                if (strcmp(tn, "Option") == 0) {
+                    if (strcmp(vn, "None") == 0) {
+                        if (fl != NULL) {
+                            checker_fail(c, loc, "Option::None takes no sub-patterns");
+                            return false;
+                        }
+                        return s->kind == TY_OPTION;
+                    }
+                    if (strcmp(vn, "Some") == 0) {
+                        if (!fl || !fl->item || fl->next) {
+                            checker_fail(c, loc, "Option::Some expects exactly one sub-pattern");
+                            return false;
+                        }
+                        if (s->kind != TY_OPTION) {
+                            checker_fail(c, loc, "Option::Some pattern needs Option subject");
+                            return false;
+                        }
+                        return check_pat_shape(c, s->as.inner, fl->item, loc);
+                    }
+                    checker_fail(c, loc, "unknown Option variant in pattern");
+                    return false;
+                }
+                checker_fail(c, loc, "match enum patterns besides Option are not type-checked yet");
+                return false;
+            }
+        case NODE_PAT_STRUCT:
+            {
+                AstList *fl;
+                if (!s || s->kind != TY_STRUCT) {
+                    checker_fail(c, loc, "struct pattern needs struct subject");
+                    return false;
+                }
+                if (strcmp(s->as.st_def.name, AS_PAT_STRUCT(pat).name) != 0) {
+                    checker_fail(c, loc, "struct pattern name does not match subject type");
+                    return false;
+                }
+                for (fl = AS_PAT_STRUCT(pat).field_pats; fl; fl = fl->next) {
+                    AstNode *pf = fl->item;
+                    Type *ft;
+                    size_t ix;
+                    if (!pf || pf->kind != NODE_PAT_FIELD) {
+                        checker_fail(c, loc, "internal: struct pattern field");
+                        return false;
+                    }
+                    ft = struct_field_type(s, AS_PAT_FIELD(pf).field, &ix);
+                    if (!ft) {
+                        checker_fail(c, loc, "unknown field in struct pattern");
+                        return false;
+                    }
+                    if (AS_PAT_FIELD(pf).pattern) {
+                        if (!check_pat_shape(c, ft, AS_PAT_FIELD(pf).pattern, loc)) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+        case NODE_PAT_TUPLE:
+        case NODE_PAT_ARRAY:
+            checker_fail(c, loc, "tuple/array patterns in match not type-checked yet");
+            return false;
+        default:
+            checker_fail(c, loc, "unsupported pattern form");
+            return false;
+    }
+}
+
+static void pat_bind_env(Checker *c, Env *e, Type *subj, AstNode *pat);
+
+static bool pat_has_bind(AstNode *pat) {
+    AstList *fl;
+
+    if (!pat) {
+        return false;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_BIND:
+            return true;
+        case NODE_PAT_OR:
+            return pat_has_bind(AS_PAT_OR(pat).left) || pat_has_bind(AS_PAT_OR(pat).right);
+        case NODE_PAT_ENUM:
+            for (fl = AS_PAT_ENUM(pat).fields; fl; fl = fl->next) {
+                if (pat_has_bind(fl->item)) {
+                    return true;
+                }
+            }
+            return false;
+        case NODE_PAT_STRUCT:
+            for (fl = AS_PAT_STRUCT(pat).field_pats; fl; fl = fl->next) {
+                AstNode *pf = fl->item;
+                if (!pf || pf->kind != NODE_PAT_FIELD) {
+                    continue;
+                }
+                if (AS_PAT_FIELD(pf).pattern) {
+                    if (pat_has_bind(AS_PAT_FIELD(pf).pattern)) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static void pat_bind_env(Checker *c, Env *e, Type *subj, AstNode *pat) {
+    Type *s = prune(subj);
+
+    if (!pat || c->error) {
+        return;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_WILDCARD:
+            return;
+        case NODE_PAT_BIND:
+            env_insert(e, AS_PAT_BIND(pat).name, s);
+            return;
+        case NODE_PAT_OR:
+            if (pat_has_bind(pat)) {
+                checker_fail(c, pat->loc, "or-patterns cannot introduce bindings yet");
+            }
+            return;
+        case NODE_PAT_LITERAL:
+            return;
+        case NODE_PAT_ENUM:
+            if (strcmp(AS_PAT_ENUM(pat).type_name, "Option") == 0 && strcmp(AS_PAT_ENUM(pat).variant, "Some") == 0) {
+                AstList *fl = AS_PAT_ENUM(pat).fields;
+                if (s && s->kind == TY_OPTION && fl && fl->item && !fl->next) {
+                    pat_bind_env(c, e, s->as.inner, fl->item);
+                }
+            }
+            return;
+        case NODE_PAT_STRUCT:
+            {
+                AstList *fl;
+                for (fl = AS_PAT_STRUCT(pat).field_pats; fl && !c->error; fl = fl->next) {
+                    AstNode *pf = fl->item;
+                    Type *ft;
+                    size_t ix;
+                    if (!pf || pf->kind != NODE_PAT_FIELD) {
+                        continue;
+                    }
+                    ft = struct_field_type(s, AS_PAT_FIELD(pf).field, &ix);
+                    if (!ft) {
+                        checker_fail(c, pf->loc, "unknown struct field in pattern");
+                        return;
+                    }
+                    if (AS_PAT_FIELD(pf).pattern) {
+                        pat_bind_env(c, e, ft, AS_PAT_FIELD(pf).pattern);
+                    } else {
+                        env_insert(e, AS_PAT_FIELD(pf).field, ft);
+                    }
+                }
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+static Type *infer_match_expr(Checker *c, AstNode *n) {
+    Type *sty;
+    Type *acc = NULL;
+    AstList *a;
+    AstNode *subj = AS_MATCH(n).subject;
+    AstList *arms = AS_MATCH(n).arms;
+
+    sty = infer_expr(c, subj);
+    if (c->error) {
+        return NULL;
+    }
+    if (!match_exhaustive_for_type(c, sty, arms, n->loc)) {
+        return NULL;
+    }
+
+    for (a = arms; a && !c->error; a = a->next) {
+        AstNode *arm = a->item;
+        AstNode *pat;
+        AstNode *guard;
+        AstNode *body;
+        Env arm_env = { NULL, c->current_env };
+        Type *bt;
+
+        if (!arm || arm->kind != NODE_MATCH_ARM) {
+            checker_fail(c, n->loc, "internal: match arm");
+            return NULL;
+        }
+        pat = AS_MATCH_ARM(arm).pattern;
+        guard = AS_MATCH_ARM(arm).guard;
+        body = AS_MATCH_ARM(arm).body;
+
+        if (!check_pat_shape(c, sty, pat, pat->loc)) {
+            env_free_head(&arm_env);
+            return NULL;
+        }
+        pat_bind_env(c, &arm_env, sty, pat);
+        if (c->error) {
+            env_free_head(&arm_env);
+            return NULL;
+        }
+
+        c->current_env = &arm_env;
+        if (guard) {
+            Type *gt = infer_expr(c, guard);
+            if (c->error) {
+                c->current_env = arm_env.parent;
+                env_free_head(&arm_env);
+                return NULL;
+            }
+            if (!unify(c, gt, ty_bool, guard->loc)) {
+                c->current_env = arm_env.parent;
+                env_free_head(&arm_env);
+                return NULL;
+            }
+        }
+        bt = infer_expr_or_block(c, body);
+        c->current_env = arm_env.parent;
+        env_free_head(&arm_env);
+        if (c->error) {
+            return NULL;
+        }
+        if (!acc) {
+            acc = bt;
+        } else if (!unify(c, acc, bt, body->loc)) {
+            return NULL;
+        }
+    }
+    return acc ? acc : ty_void;
+}
+
 static Type *struct_field_type(Type *st, const char *fname, size_t *out_index) {
     size_t i;
     st = prune(st);
@@ -786,21 +1201,139 @@ static Type *struct_field_type(Type *st, const char *fname, size_t *out_index) {
     return NULL;
 }
 
-static AstNode *lookup_fn_decl(Checker *c, const char *name) {
+static AstNode *lookup_trait_decl(AstNode *program, const char *trait_name) {
+    AstList *d;
+    if (!program || program->kind != NODE_PROGRAM || !trait_name) {
+        return NULL;
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_TRAIT_DECL && strcmp(AS_TRAIT_DECL(d->item).name, trait_name) == 0) {
+            return d->item;
+        }
+    }
+    return NULL;
+}
+
+static AstNode *find_trait_fn_sig(AstNode *trait_decl, const char *method_name) {
+    AstList *it;
+    if (!trait_decl || trait_decl->kind != NODE_TRAIT_DECL || !method_name) {
+        return NULL;
+    }
+    for (it = AS_TRAIT_DECL(trait_decl).items; it; it = it->next) {
+        if (it->item && it->item->kind == NODE_TRAIT_FN_SIG &&
+            strcmp(AS_TRAIT_FN_SIG(it->item).name, method_name) == 0) {
+            return it->item;
+        }
+    }
+    return NULL;
+}
+
+static bool type_ast_equal(const AstNode *a, const AstNode *b) {
+    if (!a && !b) {
+        return true;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    if (a->kind != b->kind) {
+        return false;
+    }
+    switch (a->kind) {
+        case NODE_TYPE_PRIMITIVE:
+            return AS_TYPE_PRIM(a).prim == AS_TYPE_PRIM(b).prim;
+        case NODE_TYPE_NAMED:
+            return strcmp(AS_TYPE_NAMED(a).name, AS_TYPE_NAMED(b).name) == 0;
+        case NODE_TYPE_ARRAY:
+            return type_ast_equal(AS_TYPE_ARRAY(a).elem_type, AS_TYPE_ARRAY(b).elem_type);
+        case NODE_TYPE_OPTION:
+            return type_ast_equal(AS_TYPE_OPTION(a).inner, AS_TYPE_OPTION(b).inner);
+        case NODE_TYPE_REF:
+            return AS_TYPE_REF(a).is_mut == AS_TYPE_REF(b).is_mut &&
+                   type_ast_equal(AS_TYPE_REF(a).inner, AS_TYPE_REF(b).inner);
+        case NODE_TYPE_TUPLE:
+            {
+                AstList *la = AS_TYPE_TUPLE(a).elem_types;
+                AstList *lb = AS_TYPE_TUPLE(b).elem_types;
+                for (; la && lb; la = la->next, lb = lb->next) {
+                    if (!type_ast_equal(la->item, lb->item)) {
+                        return false;
+                    }
+                }
+                return la == NULL && lb == NULL;
+            }
+        default:
+            return false;
+    }
+}
+
+static bool trait_sig_matches_impl_fn(AstNode *sig, AstNode *fn) {
+    AstList *ps;
+    AstList *pf;
+    if (!sig || sig->kind != NODE_TRAIT_FN_SIG || !fn || fn->kind != NODE_FN_DECL) {
+        return false;
+    }
+    if (ast_list_len(AS_TRAIT_FN_SIG(sig).params) != ast_list_len(AS_FN_DECL(fn).params)) {
+        return false;
+    }
+    for (ps = AS_TRAIT_FN_SIG(sig).params, pf = AS_FN_DECL(fn).params; ps && pf;
+         ps = ps->next, pf = pf->next) {
+        AstNode *sp = ps->item;
+        AstNode *fp = pf->item;
+        if (!sp || sp->kind != NODE_PARAM || !fp || fp->kind != NODE_PARAM) {
+            return false;
+        }
+        if (strcmp(AS_PARAM(sp).name, AS_PARAM(fp).name) != 0) {
+            return false;
+        }
+        if (!type_ast_equal(AS_PARAM(sp).type, AS_PARAM(fp).type)) {
+            return false;
+        }
+    }
+    return type_ast_equal(AS_TRAIT_FN_SIG(sig).ret_type, AS_FN_DECL(fn).ret_type);
+}
+
+static bool method_receiver_struct_matches(Type *recv_st, AstNode *fn) {
+    AstNode *p0;
+    recv_st = prune(recv_st);
+    if (!fn || fn->kind != NODE_FN_DECL || !AS_FN_DECL(fn).params || !AS_FN_DECL(fn).params->item) {
+        return false;
+    }
+    p0 = AS_FN_DECL(fn).params->item;
+    if (strcmp(AS_PARAM(p0).name, "self") != 0 || !AS_PARAM(p0).type) {
+        return false;
+    }
+    if (recv_st->kind != TY_STRUCT) {
+        return false;
+    }
+    if (AS_PARAM(p0).type->kind == NODE_TYPE_NAMED) {
+        return strcmp(AS_TYPE_NAMED(AS_PARAM(p0).type).name, recv_st->as.st_def.name) == 0;
+    }
+    return false;
+}
+
+static AstNode *lookup_fn_decl_for_method(Checker *c, const char *method_name, Type *recv_t) {
     AstList *d;
     AstList *m;
-    if (!c->program || c->program->kind != NODE_PROGRAM) {
+    recv_t = prune(recv_t);
+    if (!c->program || c->program->kind != NODE_PROGRAM || !method_name) {
         return NULL;
     }
     for (d = AS_PROGRAM(c->program).decls; d; d = d->next) {
-        if (d->item->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(d->item).name, name) == 0) {
-            return d->item;
+        if (d->item->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(d->item).name, method_name) == 0) {
+            if (method_receiver_struct_matches(recv_t, d->item)) {
+                return d->item;
+            }
         }
-        if (d->item->kind == NODE_IMPL_DECL) {
-            for (m = AS_IMPL_DECL(d->item).methods; m; m = m->next) {
-                if (m->item && m->item->kind == NODE_FN_DECL &&
-                    strcmp(AS_FN_DECL(m->item).name, name) == 0) {
-                    return m->item;
+    }
+    for (d = AS_PROGRAM(c->program).decls; d; d = d->next) {
+        if (d->item->kind != NODE_IMPL_DECL) {
+            continue;
+        }
+        for (m = AS_IMPL_DECL(d->item).methods; m; m = m->next) {
+            AstNode *fn = m->item;
+            if (fn && fn->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(fn).name, method_name) == 0) {
+                if (method_receiver_struct_matches(recv_t, fn)) {
+                    return fn;
                 }
             }
         }
@@ -1000,11 +1533,12 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
                 if (c->error) {
                     return NULL;
                 }
-                fn_ast = lookup_fn_decl(c, AS_METHOD_CALL(n).method);
+                fn_ast = lookup_fn_decl_for_method(c, AS_METHOD_CALL(n).method, recv_t);
                 if (!fn_ast) {
                     checker_fail(c, n->loc, "unknown method");
                     return NULL;
                 }
+                AS_METHOD_CALL(n).resolved_fn = fn_ast;
                 ft = env_lookup(c->global_env, AS_METHOD_CALL(n).method);
                 if (!ft || prune(ft)->kind != TY_FN) {
                     checker_fail(c, n->loc, "unknown method");
@@ -1086,6 +1620,8 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
             }
         case NODE_IF:
             return infer_if_expr(c, n);
+        case NODE_MATCH:
+            return infer_match_expr(c, n);
         case NODE_BLOCK:
             return infer_block(c, n);
         case NODE_ARRAY:
@@ -1409,7 +1945,71 @@ static void check_stmt(Checker *c, AstNode *stmt) {
                 return;
             }
         case NODE_TRY:
-            checker_fail(c, stmt->loc, "try/catch not type-checked yet");
+            {
+                AstList *cl;
+                size_t ncatch = ast_list_len(AS_TRY(stmt).catch_clauses);
+                int bump = ncatch > 0 ? 1 : 0;
+
+                if (bump) {
+                    c->catch_try_depth++;
+                }
+                (void)infer_block(c, AS_TRY(stmt).body);
+                if (c->error) {
+                    if (bump) {
+                        c->catch_try_depth--;
+                    }
+                    return;
+                }
+                for (cl = AS_TRY(stmt).catch_clauses; cl; cl = cl->next) {
+                    AstNode *cn = cl->item;
+                    Type *ct;
+
+                    if (!cn || cn->kind != NODE_CATCH_CLAUSE) {
+                        continue;
+                    }
+                    if (!AS_CATCH(cn).type || AS_CATCH(cn).type->kind != NODE_TYPE_PRIMITIVE) {
+                        checker_fail(c, cn->loc, "catch type must be a primitive type for now");
+                        if (bump) {
+                            c->catch_try_depth--;
+                        }
+                        return;
+                    }
+                    ct = ast_type_to_type(c, AS_CATCH(cn).type);
+                    if (c->error) {
+                        if (bump) {
+                            c->catch_try_depth--;
+                        }
+                        return;
+                    }
+                    {
+                        Env inner = { NULL, c->current_env };
+                        env_insert(&inner, AS_CATCH(cn).var, ct);
+                        c->current_env = &inner;
+                        (void)infer_block(c, AS_CATCH(cn).body);
+                        env_free_head(&inner);
+                        c->current_env = inner.parent;
+                    }
+                    if (c->error) {
+                        if (bump) {
+                            c->catch_try_depth--;
+                        }
+                        return;
+                    }
+                }
+                if (AS_TRY(stmt).finally_body) {
+                    (void)infer_block(c, AS_TRY(stmt).finally_body);
+                }
+                if (bump) {
+                    c->catch_try_depth--;
+                }
+                break;
+            }
+        case NODE_THROW:
+            if (c->catch_try_depth == 0) {
+                checker_fail(c, stmt->loc, "`throw` requires an enclosing `try` with at least one `catch` clause");
+                return;
+            }
+            (void)infer_expr(c, AS_THROW(stmt).expr);
             break;
         default:
             checker_fail(c, stmt->loc, "statement not supported in type checker yet");
@@ -1516,15 +2116,67 @@ static bool register_fn_sig(Checker *c, AstNode *fn) {
     return true;
 }
 
+static bool register_trait_decl(Checker *c, AstNode *tr) {
+    const char *nm = AS_TRAIT_DECL(tr).name;
+    AstList *d;
+    AstList *it;
+    int n_dup = 0;
+
+    if (!tr || tr->kind != NODE_TRAIT_DECL) {
+        checker_fail(c, (SrcLoc){0}, "internal: trait decl");
+        return false;
+    }
+    for (d = AS_PROGRAM(c->program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_TRAIT_DECL && strcmp(AS_TRAIT_DECL(d->item).name, nm) == 0) {
+            n_dup++;
+        }
+    }
+    if (n_dup > 1) {
+        checker_fail(c, tr->loc, "duplicate trait declaration");
+        return false;
+    }
+    if (env_lookup(c->global_env, nm)) {
+        checker_fail(c, tr->loc, "trait name conflicts with struct, function, or const");
+        return false;
+    }
+    if (AS_TRAIT_DECL(tr).generic_params) {
+        checker_fail(c, tr->loc, "generic traits are not supported yet");
+        return false;
+    }
+    if (AS_TRAIT_DECL(tr).super_traits) {
+        checker_fail(c, tr->loc, "trait super-bounds are not supported yet");
+        return false;
+    }
+    for (it = AS_TRAIT_DECL(tr).items; it; it = it->next) {
+        AstNode *sig = it->item;
+        AstNode *p0;
+        if (!sig || sig->kind != NODE_TRAIT_FN_SIG) {
+            checker_fail(c, tr->loc, "trait body must contain fn signatures only");
+            return false;
+        }
+        if (!AS_TRAIT_FN_SIG(sig).params || !AS_TRAIT_FN_SIG(sig).params->item) {
+            checker_fail(c, sig->loc, "trait method needs at least a self parameter");
+            return false;
+        }
+        p0 = AS_TRAIT_FN_SIG(sig).params->item;
+        if (strcmp(AS_PARAM(p0).name, "self") != 0) {
+            checker_fail(c, p0->loc, "trait method first parameter must be named self");
+            return false;
+        }
+        if (!AS_PARAM(p0).type) {
+            checker_fail(c, p0->loc, "trait method self parameter must have a type");
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool register_impl_decl(Checker *c, AstNode *impl) {
     const char *sn = AS_IMPL_DECL(impl).struct_name;
     Type *st;
     AstList *m;
+    AstNode *trait_decl = NULL;
 
-    if (AS_IMPL_DECL(impl).trait_name) {
-        checker_fail(c, impl->loc, "trait impl not supported yet");
-        return false;
-    }
     if (AS_IMPL_DECL(impl).generic_params || AS_IMPL_DECL(impl).type_generic_params) {
         checker_fail(c, impl->loc, "generic impl not supported yet");
         return false;
@@ -1536,11 +2188,20 @@ static bool register_impl_decl(Checker *c, AstNode *impl) {
     }
     st = prune(st);
 
+    if (AS_IMPL_DECL(impl).trait_name) {
+        trait_decl = lookup_trait_decl(c->program, AS_IMPL_DECL(impl).trait_name);
+        if (!trait_decl) {
+            checker_fail(c, impl->loc, "unknown trait");
+            return false;
+        }
+    }
+
     for (m = AS_IMPL_DECL(impl).methods; m; m = m->next) {
         AstNode *fn = m->item;
         AstList *pl;
         AstNode *p0;
         Type *pty;
+        AstNode *sig;
 
         if (!fn || fn->kind != NODE_FN_DECL) {
             checker_fail(c, impl->loc, "impl body must contain functions");
@@ -1567,6 +2228,17 @@ static bool register_impl_decl(Checker *c, AstNode *impl) {
         if (!unify(c, pty, st, p0->loc)) {
             checker_fail(c, p0->loc, "self type must match impl struct");
             return false;
+        }
+        if (trait_decl) {
+            sig = find_trait_fn_sig(trait_decl, AS_FN_DECL(fn).name);
+            if (!sig) {
+                checker_fail(c, fn->loc, "impl method not declared in trait");
+                return false;
+            }
+            if (!trait_sig_matches_impl_fn(sig, fn)) {
+                checker_fail(c, fn->loc, "impl method signature does not match trait");
+                return false;
+            }
         }
         if (!register_fn_sig(c, fn)) {
             return false;
@@ -1744,7 +2416,17 @@ TypeCheckResult type_check_program(AstNode *program) {
             }
         }
     }
-    /* Pass 2: consts (typed), fn signatures, impl method signatures. */
+    /* Pass 2a: traits (names must not collide with struct/fn/const). */
+    if (!chk.error) {
+        for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+            if (d->item->kind == NODE_TRAIT_DECL) {
+                if (!register_trait_decl(&chk, d->item)) {
+                    break;
+                }
+            }
+        }
+    }
+    /* Pass 2b: consts (typed), fn signatures, impl method signatures. */
     if (!chk.error) {
         for (d = AS_PROGRAM(program).decls; d; d = d->next) {
             if (d->item->kind == NODE_CONST_DECL) {
@@ -1759,7 +2441,11 @@ TypeCheckResult type_check_program(AstNode *program) {
                 if (!register_impl_decl(&chk, d->item)) {
                     break;
                 }
-            } else if (d->item->kind != NODE_STRUCT_DECL) {
+            } else if (d->item->kind == NODE_STRUCT_DECL ||
+                       d->item->kind == NODE_TRAIT_DECL ||
+                       d->item->kind == NODE_USE_DECL) {
+                continue;
+            } else {
                 checker_fail(&chk, d->item->loc, "unsupported top-level declaration");
                 break;
             }

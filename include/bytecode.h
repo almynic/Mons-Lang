@@ -65,7 +65,8 @@ typedef enum {
     OP_LT_DOUBLE,
     OP_GT_DOUBLE,
     OP_LTE_DOUBLE,
-    OP_GTE_DOUBLE
+    OP_GTE_DOUBLE,
+    OP_SWAP /* swap two stack tops (deepest = sp-2, top = sp-1) */
 } OpCode;
 
 /* Decl-order struct layouts for bytecode; `field_names` is owned (array of pointers into AST). */

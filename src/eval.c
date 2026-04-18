@@ -3,6 +3,7 @@
  *
  * Environments are singly-linked frames (EvalEnv); lookup walks parent chain.
  * halt_return + return_value implement `return` out of nested blocks.
+ * halt_throw + throw_value implement `throw` until an enclosing `try` consumes them.
  *
  * Arrays, tuples, structs are heap values with refcount (value_retain / value_release).
  * Many eval_expr paths value_release operands after use to avoid leaks.
@@ -35,9 +36,95 @@ typedef struct EvalCtx {
     EvalEnv *env;
     int halt_return; /* set by NODE_RETURN; cleared when entering a fresh block for control */
     Value return_value;
+    int halt_throw; /* set by throw; consumed by enclosing try or becomes eval error */
+    Value throw_value;
     char errbuf[256];
     const char *error;
 } EvalCtx;
+
+typedef enum {
+    HEAP_SEQ,
+    HEAP_STRUCT,
+    HEAP_CLOSURE
+} HeapKind;
+
+typedef struct HeapObj {
+    HeapKind kind;
+    void *ptr;
+    int mark;
+    struct HeapObj *next;
+} HeapObj;
+
+static HeapObj *g_heap_objs = NULL;
+
+static void heap_track(HeapKind kind, void *ptr) {
+    HeapObj *h;
+    if (!ptr) {
+        return;
+    }
+    h = (HeapObj *)malloc(sizeof(HeapObj));
+    if (!h) {
+        return;
+    }
+    h->kind = kind;
+    h->ptr = ptr;
+    h->mark = 0;
+    h->next = g_heap_objs;
+    g_heap_objs = h;
+}
+
+static HeapObj *heap_find(HeapKind kind, const void *ptr) {
+    HeapObj *h;
+    for (h = g_heap_objs; h; h = h->next) {
+        if (h->kind == kind && h->ptr == ptr) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+static void heap_untrack(HeapKind kind, const void *ptr) {
+    HeapObj **pp = &g_heap_objs;
+    while (*pp) {
+        HeapObj *h = *pp;
+        if (h->kind == kind && h->ptr == ptr) {
+            *pp = h->next;
+            free(h);
+            return;
+        }
+        pp = &h->next;
+    }
+}
+
+ValSeq *value_seq_new(void) {
+    ValSeq *seq = (ValSeq *)calloc(1, sizeof(ValSeq));
+    if (!seq) {
+        return NULL;
+    }
+    seq->refc = 1;
+    heap_track(HEAP_SEQ, seq);
+    return seq;
+}
+
+ValStruct *value_struct_new(void) {
+    ValStruct *st = (ValStruct *)calloc(1, sizeof(ValStruct));
+    if (!st) {
+        return NULL;
+    }
+    st->refc = 1;
+    heap_track(HEAP_STRUCT, st);
+    return st;
+}
+
+ValClosure *value_closure_new(void) {
+    ValClosure *cl = (ValClosure *)calloc(1, sizeof(ValClosure));
+    if (!cl) {
+        return NULL;
+    }
+    cl->refc = 1;
+    heap_track(HEAP_CLOSURE, cl);
+    return cl;
+}
 
 static void eval_fail(EvalCtx *ctx, const char *msg) {
     if (ctx->error) {
@@ -92,6 +179,7 @@ void value_release(Value *v) {
                     value_release(&v->as.seq->items[i]);
                 }
                 free(v->as.seq->items);
+                heap_untrack(HEAP_SEQ, v->as.seq);
                 free(v->as.seq);
             }
             break;
@@ -102,6 +190,7 @@ void value_release(Value *v) {
                 }
                 free(v->as.st->field_names);
                 free(v->as.st->values);
+                heap_untrack(HEAP_STRUCT, v->as.st);
                 free(v->as.st);
             }
             break;
@@ -115,6 +204,7 @@ void value_release(Value *v) {
                 if (cl->cap_names) {
                     free(cl->cap_names);
                 }
+                heap_untrack(HEAP_CLOSURE, cl);
                 free(cl);
             }
             break;
@@ -122,6 +212,187 @@ void value_release(Value *v) {
             break;
     }
     v->kind = VAL_VOID;
+}
+
+static void gc_mark_value(Value v);
+
+static void gc_mark_seq(ValSeq *seq) {
+    size_t i;
+    HeapObj *h;
+    if (!seq) {
+        return;
+    }
+    h = heap_find(HEAP_SEQ, seq);
+    if (!h || h->mark) {
+        return;
+    }
+    h->mark = 1;
+    for (i = 0; i < seq->len; i++) {
+        gc_mark_value(seq->items[i]);
+    }
+}
+
+static void gc_mark_struct(ValStruct *st) {
+    size_t i;
+    HeapObj *h;
+    if (!st) {
+        return;
+    }
+    h = heap_find(HEAP_STRUCT, st);
+    if (!h || h->mark) {
+        return;
+    }
+    h->mark = 1;
+    for (i = 0; i < st->n; i++) {
+        gc_mark_value(st->values[i]);
+    }
+}
+
+static void gc_mark_closure(ValClosure *cl) {
+    size_t i;
+    HeapObj *h;
+    if (!cl) {
+        return;
+    }
+    h = heap_find(HEAP_CLOSURE, cl);
+    if (!h || h->mark) {
+        return;
+    }
+    h->mark = 1;
+    for (i = 0; i < cl->ncap; i++) {
+        gc_mark_value(cl->cap_vals[i]);
+    }
+}
+
+static void gc_mark_value(Value v) {
+    switch (v.kind) {
+        case VAL_ARRAY:
+        case VAL_TUPLE:
+            gc_mark_seq(v.as.seq);
+            break;
+        case VAL_STRUCT:
+            gc_mark_struct(v.as.st);
+            break;
+        case VAL_CLOSURE:
+            gc_mark_closure(v.as.closure);
+            break;
+        default:
+            break;
+    }
+}
+
+static int gc_is_marked_value(Value v) {
+    HeapObj *h = NULL;
+    switch (v.kind) {
+        case VAL_ARRAY:
+        case VAL_TUPLE:
+            h = heap_find(HEAP_SEQ, v.as.seq);
+            break;
+        case VAL_STRUCT:
+            h = heap_find(HEAP_STRUCT, v.as.st);
+            break;
+        case VAL_CLOSURE:
+            h = heap_find(HEAP_CLOSURE, v.as.closure);
+            break;
+        default:
+            return 0;
+    }
+    return h && h->mark;
+}
+
+static void gc_adjust_marked_child_ref(Value v) {
+    if (!gc_is_marked_value(v)) {
+        return;
+    }
+    switch (v.kind) {
+        case VAL_ARRAY:
+        case VAL_TUPLE:
+            if (v.as.seq && v.as.seq->refc > 0) {
+                v.as.seq->refc--;
+            }
+            break;
+        case VAL_STRUCT:
+            if (v.as.st && v.as.st->refc > 0) {
+                v.as.st->refc--;
+            }
+            break;
+        case VAL_CLOSURE:
+            if (v.as.closure && v.as.closure->refc > 0) {
+                v.as.closure->refc--;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void value_gc_collect(const Value *roots, size_t nroots) {
+    HeapObj *h;
+    size_t i;
+    for (h = g_heap_objs; h; h = h->next) {
+        h->mark = 0;
+    }
+    for (i = 0; i < nroots; i++) {
+        gc_mark_value(roots[i]);
+    }
+
+    h = g_heap_objs;
+    while (h) {
+        HeapObj *next = h->next;
+        if (!h->mark) {
+            if (h->kind == HEAP_SEQ) {
+                ValSeq *seq = (ValSeq *)h->ptr;
+                if (seq) {
+                    size_t k;
+                    for (k = 0; k < seq->len; k++) {
+                        gc_adjust_marked_child_ref(seq->items[k]);
+                    }
+                    free(seq->items);
+                    seq->items = NULL;
+                }
+                free(seq);
+                heap_untrack(HEAP_SEQ, h->ptr);
+            } else if (h->kind == HEAP_STRUCT) {
+                ValStruct *st = (ValStruct *)h->ptr;
+                if (st) {
+                    size_t k;
+                    for (k = 0; k < st->n; k++) {
+                        gc_adjust_marked_child_ref(st->values[k]);
+                    }
+                    free(st->field_names);
+                    free(st->values);
+                    st->field_names = NULL;
+                    st->values = NULL;
+                }
+                free(st);
+                heap_untrack(HEAP_STRUCT, h->ptr);
+            } else if (h->kind == HEAP_CLOSURE) {
+                ValClosure *cl = (ValClosure *)h->ptr;
+                if (cl) {
+                    size_t k;
+                    for (k = 0; k < cl->ncap; k++) {
+                        gc_adjust_marked_child_ref(cl->cap_vals[k]);
+                    }
+                    free(cl->cap_vals);
+                    free(cl->cap_names);
+                    cl->cap_vals = NULL;
+                    cl->cap_names = NULL;
+                }
+                free(cl);
+                heap_untrack(HEAP_CLOSURE, h->ptr);
+            }
+        }
+        h = next;
+    }
+}
+
+size_t value_gc_live_count(void) {
+    size_t n = 0;
+    HeapObj *h;
+    for (h = g_heap_objs; h; h = h->next) {
+        n++;
+    }
+    return n;
 }
 
 static bool value_is_true(const Value *v) {
@@ -298,6 +569,73 @@ static void fv_cap_add(const char ***caps, size_t *nc, size_t *capa, const char 
 
 static void fv_walk(AstNode *n, const char *bound[], size_t nb, const char ***caps, size_t *nc, size_t *capa);
 
+static size_t fv_pat_bind_names(AstNode *pat, const char **stack, size_t nbs, size_t cap) {
+    AstList *fl;
+    if (!pat || nbs >= cap) {
+        return nbs;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_BIND:
+            stack[nbs++] = AS_PAT_BIND(pat).name;
+            return nbs;
+        case NODE_PAT_FIELD:
+            if (!AS_PAT_FIELD(pat).pattern) {
+                stack[nbs++] = AS_PAT_FIELD(pat).field;
+                return nbs;
+            }
+            return fv_pat_bind_names(AS_PAT_FIELD(pat).pattern, stack, nbs, cap);
+        case NODE_PAT_STRUCT:
+            for (fl = AS_PAT_STRUCT(pat).field_pats; fl && nbs < cap; fl = fl->next) {
+                nbs = fv_pat_bind_names(fl->item, stack, nbs, cap);
+            }
+            return nbs;
+        case NODE_PAT_ENUM:
+            if (strcmp(AS_PAT_ENUM(pat).type_name, "Option") == 0 &&
+                strcmp(AS_PAT_ENUM(pat).variant, "Some") == 0 &&
+                AS_PAT_ENUM(pat).fields && AS_PAT_ENUM(pat).fields->item && !AS_PAT_ENUM(pat).fields->next) {
+                return fv_pat_bind_names(AS_PAT_ENUM(pat).fields->item, stack, nbs, cap);
+            }
+            return nbs;
+        case NODE_PAT_OR:
+            return nbs;
+        default:
+            return nbs;
+    }
+}
+
+static void fv_pat_literals(AstNode *pat, const char *stack[], size_t nbs, const char ***caps, size_t *nc, size_t *capa) {
+    AstList *fl;
+    if (!pat) {
+        return;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_LITERAL:
+            if (AS_PAT_LIT(pat).lit) {
+                fv_walk(AS_PAT_LIT(pat).lit, stack, nbs, caps, nc, capa);
+            }
+            return;
+        case NODE_PAT_OR:
+            fv_pat_literals(AS_PAT_OR(pat).left, stack, nbs, caps, nc, capa);
+            fv_pat_literals(AS_PAT_OR(pat).right, stack, nbs, caps, nc, capa);
+            return;
+        case NODE_PAT_ENUM:
+            for (fl = AS_PAT_ENUM(pat).fields; fl; fl = fl->next) {
+                fv_pat_literals(fl->item, stack, nbs, caps, nc, capa);
+            }
+            return;
+        case NODE_PAT_STRUCT:
+            for (fl = AS_PAT_STRUCT(pat).field_pats; fl; fl = fl->next) {
+                AstNode *pf = fl->item;
+                if (pf && pf->kind == NODE_PAT_FIELD && AS_PAT_FIELD(pf).pattern) {
+                    fv_pat_literals(AS_PAT_FIELD(pf).pattern, stack, nbs, caps, nc, capa);
+                }
+            }
+            return;
+        default:
+            return;
+    }
+}
+
 static void fv_block(AstNode *block, const char *bound[], size_t nb, const char ***caps, size_t *nc, size_t *capa) {
     const char *stack[LAMBDA_BOUND_MAX];
     size_t nbs = nb;
@@ -327,6 +665,27 @@ static void fv_block(AstNode *block, const char *bound[], size_t nb, const char 
                 st2[nbs] = AS_FOR(st).var;
                 fv_block(AS_FOR(st).body, st2, nbs + 1u, caps, nc, capa);
             }
+        } else if (st->kind == NODE_TRY) {
+            fv_block(AS_TRY(st).body, stack, nbs, caps, nc, capa);
+            if (AS_TRY(st).catch_clauses) {
+                const AstList *cl;
+                for (cl = AS_TRY(st).catch_clauses; cl; cl = cl->next) {
+                    AstNode *cn = cl->item;
+                    if (cn && cn->kind == NODE_CATCH_CLAUSE) {
+                        if (nbs < LAMBDA_BOUND_MAX) {
+                            const char *st2[LAMBDA_BOUND_MAX];
+                            memcpy(st2, stack, nbs * sizeof(stack[0]));
+                            st2[nbs] = AS_CATCH(cn).var;
+                            fv_block(AS_CATCH(cn).body, st2, nbs + 1u, caps, nc, capa);
+                        }
+                    }
+                }
+            }
+            if (AS_TRY(st).finally_body) {
+                fv_block(AS_TRY(st).finally_body, stack, nbs, caps, nc, capa);
+            }
+        } else if (st->kind == NODE_THROW && AS_THROW(st).expr) {
+            fv_walk(AS_THROW(st).expr, stack, nbs, caps, nc, capa);
         }
     }
     if (AS_BLOCK(block).tail_expr) {
@@ -392,6 +751,35 @@ static void fv_walk(AstNode *n, const char *bound[], size_t nb, const char ***ca
                 }
                 if (AS_IF(n).else_body) {
                     fv_walk(AS_IF(n).else_body, bound, nb, caps, nc, capa);
+                }
+            }
+            return;
+        case NODE_MATCH:
+            {
+                AstList *arms;
+                fv_walk(AS_MATCH(n).subject, bound, nb, caps, nc, capa);
+                for (arms = AS_MATCH(n).arms; arms; arms = arms->next) {
+                    AstNode *arm = arms->item;
+                    const char *stack[LAMBDA_BOUND_MAX];
+                    size_t n2 = nb;
+                    if (arm && arm->kind == NODE_MATCH_ARM) {
+                        AstNode *pat = AS_MATCH_ARM(arm).pattern;
+                        AstNode *gu = AS_MATCH_ARM(arm).guard;
+                        AstNode *bd = AS_MATCH_ARM(arm).body;
+                        if (n2 <= LAMBDA_BOUND_MAX) {
+                            memcpy(stack, bound, nb * sizeof(bound[0]));
+                            n2 = fv_pat_bind_names(pat, stack, n2, LAMBDA_BOUND_MAX);
+                        }
+                        fv_pat_literals(pat, stack, n2, caps, nc, capa);
+                        if (gu) {
+                            fv_walk(gu, stack, n2, caps, nc, capa);
+                        }
+                        if (bd && bd->kind == NODE_BLOCK) {
+                            fv_block(bd, stack, n2, caps, nc, capa);
+                        } else if (bd) {
+                            fv_walk(bd, stack, n2, caps, nc, capa);
+                        }
+                    }
                 }
             }
             return;
@@ -474,6 +862,8 @@ static size_t struct_field_index(AstNode *struct_decl, const char *field_name) {
 static Value eval_expr(EvalCtx *ctx, AstNode *n);
 static void eval_stmt(EvalCtx *ctx, AstNode *stmt);
 static Value eval_block(EvalCtx *ctx, AstNode *block);
+static bool exn_type_matches_value(const AstNode *ty_ast, const Value *v);
+static void eval_try_stmt(EvalCtx *ctx, AstNode *stmt);
 
 static Value eval_expr_or_block(EvalCtx *ctx, AstNode *n) {
     if (n->kind == NODE_BLOCK) {
@@ -505,6 +895,157 @@ static Value eval_if_expr(EvalCtx *ctx, AstNode *n) {
     if (AS_IF(n).else_body) {
         return eval_expr_or_block(ctx, AS_IF(n).else_body);
     }
+    return val_void();
+}
+
+static bool value_equal(const Value *a, const Value *b);
+
+/* Option::Some payloads use a single-element tuple at runtime. */
+static bool match_and_bind(EvalCtx *ctx, EvalEnv *frame, const Value *subj, AstNode *pat) {
+    AstList *fl;
+    AstNode *decl;
+
+    if (!pat || ctx->error) {
+        return false;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_WILDCARD:
+            return true;
+        case NODE_PAT_BIND:
+            env_insert(ctx, frame, AS_PAT_BIND(pat).name, value_retain(*subj));
+            return true;
+        case NODE_PAT_LITERAL:
+            {
+                Value want = eval_expr(ctx, AS_PAT_LIT(pat).lit);
+                bool ok;
+                if (ctx->error) {
+                    return false;
+                }
+                ok = value_equal(subj, &want);
+                value_release(&want);
+                return ok;
+            }
+        case NODE_PAT_OR:
+            return match_and_bind(ctx, frame, subj, AS_PAT_OR(pat).left) ||
+                   match_and_bind(ctx, frame, subj, AS_PAT_OR(pat).right);
+        case NODE_PAT_ENUM:
+            {
+                const char *tn = AS_PAT_ENUM(pat).type_name;
+                const char *vn = AS_PAT_ENUM(pat).variant;
+                if (strcmp(tn, "Option") == 0) {
+                    if (strcmp(vn, "None") == 0) {
+                        return subj->kind == VAL_NONE;
+                    }
+                    if (strcmp(vn, "Some") == 0) {
+                        AstList *flds = AS_PAT_ENUM(pat).fields;
+                        AstNode *inner;
+                        if (!flds || !flds->item || flds->next) {
+                            return false;
+                        }
+                        inner = flds->item;
+                        if (subj->kind != VAL_TUPLE || !subj->as.seq || subj->as.seq->len != 1u) {
+                            return false;
+                        }
+                        return match_and_bind(ctx, frame, &subj->as.seq->items[0], inner);
+                    }
+                }
+                eval_fail(ctx, "unsupported enum pattern at runtime");
+                return false;
+            }
+        case NODE_PAT_STRUCT:
+            {
+                const char *sname = AS_PAT_STRUCT(pat).name;
+                if (subj->kind != VAL_STRUCT || !subj->as.st) {
+                    return false;
+                }
+                if (strcmp(subj->as.st->type_name, sname) != 0) {
+                    return false;
+                }
+                decl = lookup_struct_decl(ctx->program, sname);
+                if (!decl) {
+                    eval_fail(ctx, "unknown struct type in match");
+                    return false;
+                }
+                for (fl = AS_PAT_STRUCT(pat).field_pats; fl; fl = fl->next) {
+                    AstNode *pf = fl->item;
+                    const char *fname;
+                    size_t ix;
+                    if (!pf || pf->kind != NODE_PAT_FIELD) {
+                        return false;
+                    }
+                    fname = AS_PAT_FIELD(pf).field;
+                    ix = struct_field_index(decl, fname);
+                    if (ix == (size_t)-1 || ix >= subj->as.st->n) {
+                        return false;
+                    }
+                    if (AS_PAT_FIELD(pf).pattern) {
+                        if (!match_and_bind(ctx, frame, &subj->as.st->values[ix], AS_PAT_FIELD(pf).pattern)) {
+                            return false;
+                        }
+                    } else {
+                        env_insert(ctx, frame, fname, value_retain(subj->as.st->values[ix]));
+                    }
+                }
+                return true;
+            }
+        default:
+            eval_fail(ctx, "unsupported pattern at runtime");
+            return false;
+    }
+}
+
+static Value eval_match_expr(EvalCtx *ctx, AstNode *n) {
+    AstList *a;
+    Value subj = eval_expr(ctx, AS_MATCH(n).subject);
+
+    if (ctx->error) {
+        return val_void();
+    }
+    for (a = AS_MATCH(n).arms; a; a = a->next) {
+        AstNode *arm = a->item;
+        AstNode *pat;
+        AstNode *guard;
+        AstNode *body;
+        EvalEnv armf = { NULL, ctx->env };
+
+        if (!arm || arm->kind != NODE_MATCH_ARM) {
+            continue;
+        }
+        pat = AS_MATCH_ARM(arm).pattern;
+        guard = AS_MATCH_ARM(arm).guard;
+        body = AS_MATCH_ARM(arm).body;
+        if (!match_and_bind(ctx, &armf, &subj, pat)) {
+            env_free_head(&armf);
+            continue;
+        }
+        if (guard) {
+            Value gv;
+            ctx->env = &armf;
+            gv = eval_expr(ctx, guard);
+            ctx->env = armf.parent;
+            if (ctx->error) {
+                env_free_head(&armf);
+                value_release(&subj);
+                return val_void();
+            }
+            if (!value_is_true(&gv)) {
+                value_release(&gv);
+                env_free_head(&armf);
+                continue;
+            }
+            value_release(&gv);
+        }
+        ctx->env = &armf;
+        {
+            Value out = eval_expr_or_block(ctx, body);
+            ctx->env = armf.parent;
+            env_free_head(&armf);
+            value_release(&subj);
+            return out;
+        }
+    }
+    eval_fail(ctx, "non-exhaustive match at runtime");
+    value_release(&subj);
     return val_void();
 }
 
@@ -962,7 +1503,10 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
         case NODE_METHOD_CALL:
             {
                 const char *mname = AS_METHOD_CALL(n).method;
-                AstNode *fn = lookup_fn(ctx->program, mname);
+                AstNode *fn = AS_METHOD_CALL(n).resolved_fn;
+                if (!fn) {
+                    fn = lookup_fn(ctx->program, mname);
+                }
                 size_t nparam;
                 size_t argc;
                 Value *argv;
@@ -1013,6 +1557,8 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
             }
         case NODE_IF:
             return eval_if_expr(ctx, n);
+        case NODE_MATCH:
+            return eval_match_expr(ctx, n);
         case NODE_BLOCK:
             return eval_block(ctx, n);
         case NODE_ARRAY:
@@ -1047,7 +1593,7 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                     }
                     i++;
                 }
-                seq = (ValSeq *)malloc(sizeof(ValSeq));
+                seq = value_seq_new();
                 if (!seq) {
                     for (i = 0; i < nmem; i++) {
                         value_release(&tmp[i]);
@@ -1057,7 +1603,6 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                     return val_void();
                 }
                 seq->len = nmem;
-                seq->refc = 1;
                 seq->items = tmp;
                 v.kind = n->kind == NODE_ARRAY ? VAL_ARRAY : VAL_TUPLE;
                 v.as.seq = seq;
@@ -1232,7 +1777,7 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                     }
                 }
 
-                vs = (ValStruct *)malloc(sizeof(ValStruct));
+                vs = value_struct_new();
                 if (!vs) {
                     for (i = 0; i < nf; i++) {
                         value_release(&vals[i]);
@@ -1242,7 +1787,6 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                     eval_fail(ctx, "out of memory");
                     return val_void();
                 }
-                vs->refc = 1;
                 vs->type_name = sname;
                 vs->n = nf;
                 vs->field_names = fnames;
@@ -1302,13 +1846,12 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                     fv_walk(AS_LAMBDA(n).body, stack, nb, &caps, &nc, &capa);
                 }
 
-                cl = (ValClosure *)malloc(sizeof(ValClosure));
+                cl = value_closure_new();
                 if (!cl) {
                     free(caps);
                     eval_fail(ctx, "out of memory");
                     return val_void();
                 }
-                cl->refc = 1;
                 cl->lambda = n;
                 cl->is_bytecode = false;
                 cl->bc_chunk_idx = 0;
@@ -1357,8 +1900,171 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
     }
 }
 
+static bool exn_type_matches_value(const AstNode *ty_ast, const Value *v) {
+    if (!ty_ast || ty_ast->kind != NODE_TYPE_PRIMITIVE || !v) {
+        return false;
+    }
+    switch (AS_TYPE_PRIM(ty_ast).prim) {
+        case PRIM_INT:
+            return v->kind == VAL_INT;
+        case PRIM_FLOAT:
+            return v->kind == VAL_FLOAT;
+        case PRIM_DOUBLE:
+            return v->kind == VAL_DOUBLE;
+        case PRIM_BOOL:
+            return v->kind == VAL_BOOL;
+        case PRIM_STRING:
+            return v->kind == VAL_STRING;
+        default:
+            return false;
+    }
+}
+
+static void eval_try_stmt(EvalCtx *ctx, AstNode *stmt) {
+    AstList *cl;
+    AstNode *fin = AS_TRY(stmt).finally_body;
+    int had_ret = 0;
+    Value ret_v = val_void();
+    int had_thr = 0;
+    Value thr_v = val_void();
+    int stashed = 0;
+    Value stash = val_void();
+
+    ctx->halt_return = 0;
+    ctx->halt_throw = 0;
+
+    (void)eval_block(ctx, AS_TRY(stmt).body);
+
+    if (ctx->halt_return) {
+        had_ret = 1;
+        ret_v = value_retain(ctx->return_value);
+        ctx->halt_return = 0;
+    }
+    if (ctx->halt_throw) {
+        had_thr = 1;
+        thr_v = value_retain(ctx->throw_value);
+        ctx->halt_throw = 0;
+        value_release(&ctx->throw_value);
+        ctx->throw_value = val_void();
+    }
+
+    if (had_thr && !ctx->error) {
+        for (cl = AS_TRY(stmt).catch_clauses; cl; cl = cl->next) {
+            AstNode *cn = cl->item;
+            if (!cn || cn->kind != NODE_CATCH_CLAUSE) {
+                continue;
+            }
+            if (!exn_type_matches_value(AS_CATCH(cn).type, &thr_v)) {
+                continue;
+            }
+            {
+                EvalEnv ce = { NULL, ctx->env };
+                env_insert(ctx, &ce, AS_CATCH(cn).var, value_retain(thr_v));
+                ctx->env = &ce;
+                (void)eval_block(ctx, AS_CATCH(cn).body);
+                ctx->env = ce.parent;
+                env_free_head(&ce);
+            }
+            value_release(&thr_v);
+            had_thr = 0;
+            thr_v = val_void();
+
+            if (ctx->halt_return) {
+                if (had_ret) {
+                    value_release(&ret_v);
+                }
+                had_ret = 1;
+                ret_v = value_retain(ctx->return_value);
+                ctx->halt_return = 0;
+            }
+            if (ctx->halt_throw) {
+                had_thr = 1;
+                thr_v = value_retain(ctx->throw_value);
+                ctx->halt_throw = 0;
+                value_release(&ctx->throw_value);
+                ctx->throw_value = val_void();
+            }
+            break;
+        }
+    }
+
+    if (ctx->error) {
+        value_release(&ret_v);
+        value_release(&thr_v);
+        if (stashed) {
+            value_release(&stash);
+        }
+        return;
+    }
+
+    if (fin) {
+        if (had_thr) {
+            stashed = 1;
+            stash = thr_v;
+            had_thr = 0;
+            thr_v = val_void();
+        }
+
+        ctx->halt_return = 0;
+        ctx->halt_throw = 0;
+
+        (void)eval_block(ctx, fin);
+
+        if (ctx->error) {
+            value_release(&ret_v);
+            value_release(&thr_v);
+            if (stashed) {
+                value_release(&stash);
+            }
+            return;
+        }
+
+        if (ctx->halt_throw) {
+            if (stashed) {
+                value_release(&stash);
+                stashed = 0;
+            }
+            had_thr = 1;
+            thr_v = value_retain(ctx->throw_value);
+            ctx->halt_throw = 0;
+            value_release(&ctx->throw_value);
+            ctx->throw_value = val_void();
+        } else if (ctx->halt_return) {
+            if (stashed) {
+                value_release(&stash);
+                stashed = 0;
+            }
+            if (had_ret) {
+                value_release(&ret_v);
+            }
+            had_ret = 1;
+            ret_v = value_retain(ctx->return_value);
+            ctx->halt_return = 0;
+        } else if (stashed) {
+            had_thr = 1;
+            thr_v = stash;
+            stashed = 0;
+            stash = val_void();
+        }
+    }
+
+    if (had_ret) {
+        ctx->halt_return = 1;
+        ctx->return_value = ret_v;
+    } else {
+        value_release(&ret_v);
+    }
+
+    if (had_thr) {
+        ctx->halt_throw = 1;
+        ctx->throw_value = thr_v;
+    } else {
+        value_release(&thr_v);
+    }
+}
+
 static void eval_stmt(EvalCtx *ctx, AstNode *stmt) {
-    if (ctx->error || ctx->halt_return) {
+    if (ctx->error || ctx->halt_return || ctx->halt_throw) {
         return;
     }
     switch (stmt->kind) {
@@ -1398,7 +2104,8 @@ static void eval_stmt(EvalCtx *ctx, AstNode *stmt) {
                 }
                 if (iter_v.as.seq) {
                     size_t idx;
-                    for (idx = 0; idx < iter_v.as.seq->len && !ctx->error && !ctx->halt_return; idx++) {
+                    for (idx = 0; idx < iter_v.as.seq->len && !ctx->error && !ctx->halt_return && !ctx->halt_throw;
+                         idx++) {
                         EvalEnv loop = { NULL, ctx->env };
                         Value elem = value_retain(iter_v.as.seq->items[idx]);
                         env_insert(ctx, &loop, AS_FOR(stmt).var, elem);
@@ -1411,7 +2118,7 @@ static void eval_stmt(EvalCtx *ctx, AstNode *stmt) {
                         (void)eval_block(ctx, AS_FOR(stmt).body);
                         ctx->env = loop.parent;
                         env_free_head(&loop);
-                        if (ctx->halt_return) {
+                        if (ctx->halt_return || ctx->halt_throw) {
                             break;
                         }
                     }
@@ -1419,8 +2126,18 @@ static void eval_stmt(EvalCtx *ctx, AstNode *stmt) {
                 value_release(&iter_v);
                 break;
             }
+        case NODE_THROW:
+            {
+                Value ex = eval_expr(ctx, AS_THROW(stmt).expr);
+                if (ctx->error) {
+                    return;
+                }
+                ctx->throw_value = ex;
+                ctx->halt_throw = 1;
+                break;
+            }
         case NODE_TRY:
-            eval_fail(ctx, "statement not supported by interpreter yet");
+            eval_try_stmt(ctx, stmt);
             break;
         default:
             eval_fail(ctx, "unsupported statement");
@@ -1439,7 +2156,7 @@ static Value eval_block(EvalCtx *ctx, AstNode *block_node) {
     AstList *s;
     for (s = AS_BLOCK(block_node).stmts; s; s = s->next) {
         eval_stmt(ctx, s->item);
-        if (ctx->error || ctx->halt_return) {
+        if (ctx->error || ctx->halt_return || ctx->halt_throw) {
             break;
         }
     }
@@ -1447,7 +2164,7 @@ static Value eval_block(EvalCtx *ctx, AstNode *block_node) {
     Value out = val_void();
     if (!ctx->error && ctx->halt_return) {
         out = ctx->return_value;
-    } else if (!ctx->error && AS_BLOCK(block_node).tail_expr) {
+    } else if (!ctx->error && !ctx->halt_throw && AS_BLOCK(block_node).tail_expr) {
         out = eval_expr(ctx, AS_BLOCK(block_node).tail_expr);
         if (ctx->halt_return) {
             out = ctx->return_value;
@@ -1514,10 +2231,18 @@ static Value eval_invoke_closure(EvalCtx *ctx, ValClosure *cl, const Value *args
     saved = ctx->env;
     ctx->env = &argf;
     ctx->halt_return = 0;
+    ctx->halt_throw = 0;
 
     out = eval_lambda_body(ctx, AS_LAMBDA(lam).body);
     if (ctx->halt_return) {
         out = ctx->return_value;
+    }
+    if (ctx->halt_throw) {
+        value_release(&ctx->throw_value);
+        ctx->halt_throw = 0;
+        ctx->throw_value = val_void();
+        eval_fail(ctx, "uncaught exception");
+        out = val_void();
     }
     ctx->halt_return = 0;
     ctx->env = saved;
@@ -1548,10 +2273,18 @@ static Value eval_invoke_fn(EvalCtx *ctx, AstNode *fn, const Value *args, size_t
     EvalEnv *saved = ctx->env;
     ctx->env = &frame;
     ctx->halt_return = 0;
+    ctx->halt_throw = 0;
 
     Value out = eval_block(ctx, AS_FN_DECL(fn).body);
     if (ctx->halt_return) {
         out = ctx->return_value;
+    }
+    if (ctx->halt_throw) {
+        value_release(&ctx->throw_value);
+        ctx->halt_throw = 0;
+        ctx->throw_value = val_void();
+        eval_fail(ctx, "uncaught exception");
+        out = val_void();
     }
     ctx->halt_return = 0;
     ctx->env = saved;
@@ -1600,6 +2333,7 @@ EvalResult eval_call_by_name(AstNode *program, const char *fn_name, const Value 
     eval_seed_consts(&ctx, &global);
     if (ctx.error) {
         env_free_head(&global);
+        value_gc_collect(NULL, 0);
         er.error_message = ctx.error;
         return er;
     }
@@ -1608,10 +2342,12 @@ EvalResult eval_call_by_name(AstNode *program, const char *fn_name, const Value 
         Value out = eval_invoke_fn(&ctx, fn, args, nargs);
         if (ctx.error) {
             env_free_head(&global);
+            value_gc_collect(NULL, 0);
             er.error_message = ctx.error;
             return er;
         }
         env_free_head(&global);
+        value_gc_collect(&out, 1);
         er.ok = true;
         er.result = out;
         return er;

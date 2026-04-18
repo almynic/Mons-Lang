@@ -64,6 +64,7 @@ typedef enum {
     NODE_FOR,
     NODE_TRY,
     NODE_CATCH_CLAUSE,
+    NODE_THROW,
 
     /* ── Expressions ── */
     NODE_BINARY,
@@ -111,6 +112,7 @@ typedef enum {
     NODE_PAT_TUPLE,
     NODE_PAT_ARRAY,
     NODE_PAT_OR,
+    NODE_PAT_FIELD, /* struct pattern element: `field` or `field: pat` */
 
     NODE_KIND_COUNT   /* sentinel — always last */
 } NodeKind;
@@ -292,6 +294,11 @@ typedef struct AstNode {
             struct AstNode *body;   /* NODE_BLOCK */
         } catch_clause;
 
+        /* ── NODE_THROW ─────────────────────────────────────────── */
+        struct {
+            struct AstNode *expr;
+        } throw_stmt;
+
         /* ── NODE_BINARY ──────────────────────────────────────── */
         struct {
             BinOp           op;
@@ -345,6 +352,7 @@ typedef struct AstNode {
             const char     *method;
             AstList        *args;
             AstList        *type_args;
+            struct AstNode *resolved_fn; /* set by type checker: NODE_FN_DECL target */
         } method_call;
 
         /* ── NODE_FIELD_ACCESS ────────────────────────────────── */
@@ -484,6 +492,12 @@ typedef struct AstNode {
             struct AstNode *right;
         } pat_or;
 
+        /* NODE_PAT_FIELD — `field` or `field: pattern` inside NODE_PAT_STRUCT */
+        struct {
+            const char     *field;
+            struct AstNode *pattern; /* NULL → shorthand bind `field` as name */
+        } pat_field;
+
     } as;   /* end union */
 
 } AstNode;
@@ -498,6 +512,7 @@ typedef struct AstNode {
 #define AS_STRUCT_DECL(n)   ((n)->as.struct_decl)
 #define AS_STRUCT_FIELD(n)  ((n)->as.struct_field)
 #define AS_TRAIT_DECL(n)    ((n)->as.trait_decl)
+#define AS_TRAIT_FN_SIG(n)  ((n)->as.trait_fn_sig)
 #define AS_IMPL_DECL(n)     ((n)->as.impl_decl)
 #define AS_MACRO_DECL(n)    ((n)->as.macro_decl)
 #define AS_USE_DECL(n)      ((n)->as.use_decl)
@@ -509,6 +524,7 @@ typedef struct AstNode {
 #define AS_FOR(n)           ((n)->as.for_loop)
 #define AS_TRY(n)           ((n)->as.try_stmt)
 #define AS_CATCH(n)         ((n)->as.catch_clause)
+#define AS_THROW(n)         ((n)->as.throw_stmt)
 #define AS_BINARY(n)        ((n)->as.binary)
 #define AS_UNARY(n)         ((n)->as.unary)
 #define AS_ASSIGN(n)        ((n)->as.assign)
@@ -546,6 +562,7 @@ typedef struct AstNode {
 #define AS_PAT_TUPLE(n)     ((n)->as.pat_tuple)
 #define AS_PAT_ARRAY(n)     ((n)->as.pat_array)
 #define AS_PAT_OR(n)        ((n)->as.pat_or)
+#define AS_PAT_FIELD(n)     ((n)->as.pat_field)
 
 
 /* ── Allocator interface (implement in arena.c) ────────── */

@@ -49,3 +49,51 @@ pub const SMOKE_FLAG: bool = true;
 pub fn if_allcaps_bool_cond() -> int {
     if SMOKE_FLAG { 7 } else { 0 }
 }
+
+pub fn match_int_ok() -> int {
+    match 3 {
+        0 => 0,
+        n => n + 10,
+    }
+}
+
+pub fn match_or_int_ok() -> int {
+    match 2 {
+        0 | 1 => 5,
+        n => n,
+    }
+}
+
+pub fn try_catch_int_ok() -> int {
+    let mut r = 0;
+    try {
+        throw 7;
+    } catch (e: int) {
+        r = e + 2;
+    };
+    r
+}
+
+pub fn try_string_catch_ok() -> int {
+    let mut n = 0;
+    try {
+        throw "x";
+    } catch (s: string) {
+        n = 3;
+    };
+    n
+}
+
+pub fn nested_try_ok() -> int {
+    let mut out = 0;
+    try {
+        try {
+            throw 3;
+        } catch (a: int) {
+            throw a + 1;
+        };
+    } catch (b: int) {
+        out = b + 10;
+    };
+    out
+}

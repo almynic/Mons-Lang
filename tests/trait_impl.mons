@@ -1,0 +1,35 @@
+// Trait declarations + `impl Trait for Type` (type checker + interpreter + bytecode dispatch).
+
+trait Bump {
+    fn bump(self: Counter) -> int;
+}
+
+trait Zero {
+    fn as_zero(self: Counter) -> int;
+}
+
+struct Counter {
+    n: int,
+}
+
+impl Bump for Counter {
+    fn bump(self: Counter) -> int {
+        self.n + 1
+    }
+}
+
+impl Zero for Counter {
+    fn as_zero(self: Counter) -> int {
+        0
+    }
+}
+
+pub fn trait_bump_ok() -> int {
+    let c = Counter { n: 5, };
+    c.bump()
+}
+
+pub fn trait_two_methods_ok() -> int {
+    let c = Counter { n: 2, };
+    c.bump() + c.as_zero()
+}

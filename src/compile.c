@@ -121,6 +121,31 @@ int bc_fn_index(AstNode *program, const char *name) {
     return -1;
 }
 
+int bc_fn_decl_index(AstNode *program, AstNode *fn_decl) {
+    int idx = 0;
+    AstList *d;
+    AstList *m;
+    if (!program || program->kind != NODE_PROGRAM || !fn_decl || fn_decl->kind != NODE_FN_DECL) {
+        return -1;
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_FN_DECL) {
+            if (d->item == fn_decl) {
+                return idx;
+            }
+            idx++;
+        } else if (d->item->kind == NODE_IMPL_DECL) {
+            for (m = AS_IMPL_DECL(d->item).methods; m; m = m->next) {
+                if (m->item == fn_decl) {
+                    return idx;
+                }
+                idx++;
+            }
+        }
+    }
+    return -1;
+}
+
 static int fn_name_to_index(AstNode *program, const char *name) {
     return bc_fn_index(program, name);
 }
@@ -221,6 +246,7 @@ static bool bc_intern_symbol(CompileProgramResult *r, const char *s, uint16_t *o
 }
 
 static void compile_expr(Ctx *c, AstNode *n);
+static void compile_match_expr(Ctx *c, AstNode *n);
 
 static void compile_struct_init(Ctx *c, AstNode *n) {
     const char *sname;
@@ -513,6 +539,10 @@ static void compile_block_ex(Ctx *c, AstNode *blk, bool trailing_return) {
                     return;
                 }
                 break;
+            case NODE_TRY:
+            case NODE_THROW:
+                compile_fail(c, "try/catch/finally and throw are not supported in bytecode yet");
+                return;
             default:
                 compile_fail(c, "statement not supported in bytecode");
                 return;
@@ -701,6 +731,10 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
                     return;
                 }
                 break;
+            case NODE_TRY:
+            case NODE_THROW:
+                compile_fail(c, "try/catch/finally and throw are not supported in bytecode yet");
+                return;
             default:
                 compile_fail(c, "statement not supported in bytecode");
                 return;
@@ -777,6 +811,414 @@ static void compile_if_expr(Ctx *c, AstNode *n) {
         for (i = 0; i < n_exit; i++) {
             size_t j = exit_patches[i];
             chunk_patch_u16(c->chunk, j + 1u, (uint16_t)(end_ip - (j + 3u)));
+        }
+    }
+}
+
+static void emit_push_const_value(Ctx *c, Value v) {
+    int idx = chunk_add_constant(c->chunk, v);
+    if (idx < 0) {
+        compile_fail(c, "out of memory");
+        return;
+    }
+    chunk_emit_u8(c->chunk, OP_PUSH_CONST);
+    chunk_emit_u16(c->chunk, (uint16_t)idx);
+}
+
+/* Emit pattern test; on failure pops the bool and jumps (u16 placeholder patched to next arm).
+ * Returns offset of the u16 operand, or 0 if no jump was emitted. */
+static size_t emit_match_pat_test(Ctx *c, AstNode *pat, uint8_t val_slot, uint8_t scratch_slot, uint8_t payload_slot) {
+    AstList *fl;
+    size_t at;
+
+    if (!pat || c->error) {
+        return 0;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_WILDCARD:
+        case NODE_PAT_BIND:
+            return 0;
+        case NODE_PAT_OR:
+            compile_fail(c, "bytecode match: `|` patterns are not compiled yet");
+            return 0;
+        case NODE_PAT_LITERAL:
+            chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+            chunk_emit_u8(c->chunk, val_slot);
+            compile_expr(c, AS_PAT_LIT(pat).lit);
+            if (c->error) {
+                return 0;
+            }
+            chunk_emit_u8(c->chunk, OP_EQ);
+            at = c->chunk->len;
+            chunk_emit_u8(c->chunk, OP_POP_JUMP_IF_FALSE);
+            chunk_emit_u16(c->chunk, 0);
+            return at;
+        case NODE_PAT_ENUM:
+            if (strcmp(AS_PAT_ENUM(pat).type_name, "Option") == 0) {
+                if (strcmp(AS_PAT_ENUM(pat).variant, "None") == 0) {
+                    Value nv;
+                    nv.kind = VAL_NONE;
+                    chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                    chunk_emit_u8(c->chunk, val_slot);
+                    emit_push_const_value(c, nv);
+                    if (c->error) {
+                        return 0;
+                    }
+                    chunk_emit_u8(c->chunk, OP_EQ);
+                    at = c->chunk->len;
+                    chunk_emit_u8(c->chunk, OP_POP_JUMP_IF_FALSE);
+                    chunk_emit_u16(c->chunk, 0);
+                    return at;
+                }
+                if (strcmp(AS_PAT_ENUM(pat).variant, "Some") == 0) {
+                    fl = AS_PAT_ENUM(pat).fields;
+                    if (!fl || !fl->item || fl->next) {
+                        compile_fail(c, "internal: Option::Some pattern");
+                        return 0;
+                    }
+                    chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                    chunk_emit_u8(c->chunk, val_slot);
+                    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                    chunk_emit_u8(c->chunk, scratch_slot);
+                    chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                    chunk_emit_u8(c->chunk, scratch_slot);
+                    chunk_emit_u8(c->chunk, OP_DUP);
+                    chunk_emit_u8(c->chunk, OP_ARRAY_LEN);
+                    {
+                        Value one;
+                        one.kind = VAL_INT;
+                        one.as.i = 1;
+                        emit_push_const_value(c, one);
+                    }
+                    if (c->error) {
+                        return 0;
+                    }
+                    chunk_emit_u8(c->chunk, OP_EQ);
+                    chunk_emit_u8(c->chunk, OP_SWAP);
+                    chunk_emit_u8(c->chunk, OP_POP);
+                    at = c->chunk->len;
+                    chunk_emit_u8(c->chunk, OP_POP_JUMP_IF_FALSE);
+                    chunk_emit_u16(c->chunk, 0);
+                    {
+                        AstNode *inner = fl->item;
+                        if (inner->kind == NODE_PAT_LITERAL) {
+                            compile_fail(c, "bytecode match: Option::Some with literal inner pattern not supported yet");
+                            return 0;
+                        }
+                        if (emit_match_pat_test(c, inner, scratch_slot, scratch_slot, payload_slot) != 0) {
+                            compile_fail(c, "bytecode match: nested tests in Option::Some not supported yet");
+                            return 0;
+                        }
+                        return at;
+                    }
+                }
+            }
+            compile_fail(c, "bytecode match: unsupported enum pattern");
+            return 0;
+        case NODE_PAT_STRUCT:
+            return 0;
+        default:
+            compile_fail(c, "bytecode match: unsupported pattern");
+            return 0;
+    }
+}
+
+static void compile_pat_emit_binds(Ctx *c, AstNode *pat, uint8_t subj_slot, uint8_t scratch_slot);
+
+static void compile_pat_emit_binds(Ctx *c, AstNode *pat, uint8_t subj_slot, uint8_t scratch_slot) {
+    AstList *fl;
+    AstNode *decl;
+    int li;
+    size_t ix;
+
+    if (!pat || c->error) {
+        return;
+    }
+    switch (pat->kind) {
+        case NODE_PAT_WILDCARD:
+            return;
+        case NODE_PAT_BIND:
+            {
+                uint8_t slot = c->next_slot++;
+                if (c->next_slot > 255) {
+                    compile_fail(c, "too many locals");
+                    return;
+                }
+                if (c->chunk->nlocals < c->next_slot) {
+                    c->chunk->nlocals = c->next_slot;
+                }
+                c->local_names[slot] = AS_PAT_BIND(pat).name;
+                chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                chunk_emit_u8(c->chunk, subj_slot);
+                chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                chunk_emit_u8(c->chunk, slot);
+            }
+            return;
+        case NODE_PAT_OR:
+            compile_pat_emit_binds(c, AS_PAT_OR(pat).left, subj_slot, scratch_slot);
+            return;
+        case NODE_PAT_LITERAL:
+            return;
+        case NODE_PAT_ENUM:
+            if (strcmp(AS_PAT_ENUM(pat).type_name, "Option") == 0 && strcmp(AS_PAT_ENUM(pat).variant, "Some") == 0) {
+                AstNode *inner;
+                uint8_t inner_slot;
+                fl = AS_PAT_ENUM(pat).fields;
+                if (!fl || !fl->item || fl->next) {
+                    return;
+                }
+                inner = fl->item;
+                chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                chunk_emit_u8(c->chunk, scratch_slot);
+                {
+                    Value z;
+                    z.kind = VAL_INT;
+                    z.as.i = 0;
+                    emit_push_const_value(c, z);
+                }
+                if (c->error) {
+                    return;
+                }
+                chunk_emit_u8(c->chunk, OP_INDEX_INT);
+                if (inner->kind == NODE_PAT_WILDCARD) {
+                    chunk_emit_u8(c->chunk, OP_POP);
+                    return;
+                }
+                if (inner->kind == NODE_PAT_BIND) {
+                    inner_slot = c->next_slot++;
+                    if (c->next_slot > 255) {
+                        compile_fail(c, "too many locals");
+                        return;
+                    }
+                    if (c->chunk->nlocals < c->next_slot) {
+                        c->chunk->nlocals = c->next_slot;
+                    }
+                    c->local_names[inner_slot] = AS_PAT_BIND(inner).name;
+                    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                    chunk_emit_u8(c->chunk, inner_slot);
+                    return;
+                }
+                inner_slot = c->next_slot++;
+                if (c->next_slot > 255) {
+                    compile_fail(c, "too many locals");
+                    return;
+                }
+                if (c->chunk->nlocals < c->next_slot) {
+                    c->chunk->nlocals = c->next_slot;
+                }
+                c->local_names[inner_slot] = NULL;
+                chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                chunk_emit_u8(c->chunk, inner_slot);
+                compile_pat_emit_binds(c, inner, inner_slot, scratch_slot);
+            }
+            return;
+        case NODE_PAT_STRUCT:
+            decl = lookup_struct_decl_node(c->program, AS_PAT_STRUCT(pat).name);
+            if (!decl) {
+                compile_fail(c, "unknown struct in match bind");
+                return;
+            }
+            li = struct_layout_named(c->bc, AS_PAT_STRUCT(pat).name);
+            if (li < 0) {
+                compile_fail(c, "struct layout missing for match");
+                return;
+            }
+            for (fl = AS_PAT_STRUCT(pat).field_pats; fl && !c->error; fl = fl->next) {
+                AstNode *pf = fl->item;
+                const char *fname;
+                AstList *sf;
+                if (!pf || pf->kind != NODE_PAT_FIELD) {
+                    continue;
+                }
+                fname = AS_PAT_FIELD(pf).field;
+                ix = 0;
+                for (sf = AS_STRUCT_DECL(decl).fields; sf; sf = sf->next, ix++) {
+                    if (strcmp(AS_STRUCT_FIELD(sf->item).name, fname) == 0) {
+                        goto found_field2;
+                    }
+                }
+                compile_fail(c, "unknown struct field in match pattern");
+                return;
+found_field2:
+                chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+                chunk_emit_u8(c->chunk, subj_slot);
+                if (ix > 255u) {
+                    compile_fail(c, "too many struct fields for match");
+                    return;
+                }
+                chunk_emit_u8(c->chunk, OP_GET_FIELD);
+                chunk_emit_u8(c->chunk, (uint8_t)ix);
+                if (AS_PAT_FIELD(pf).pattern) {
+                    uint8_t fs = c->next_slot++;
+                    if (c->next_slot > 255) {
+                        compile_fail(c, "too many locals");
+                        return;
+                    }
+                    if (c->chunk->nlocals < c->next_slot) {
+                        c->chunk->nlocals = c->next_slot;
+                    }
+                    c->local_names[fs] = NULL;
+                    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                    chunk_emit_u8(c->chunk, fs);
+                    compile_pat_emit_binds(c, AS_PAT_FIELD(pf).pattern, fs, scratch_slot);
+                } else {
+                    uint8_t fs = c->next_slot++;
+                    if (c->next_slot > 255) {
+                        compile_fail(c, "too many locals");
+                        return;
+                    }
+                    if (c->chunk->nlocals < c->next_slot) {
+                        c->chunk->nlocals = c->next_slot;
+                    }
+                    c->local_names[fs] = fname;
+                    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+                    chunk_emit_u8(c->chunk, fs);
+                }
+            }
+            (void)li;
+            return;
+        default:
+            return;
+    }
+}
+
+static void compile_match_expr(Ctx *c, AstNode *n) {
+    AstList *a;
+    uint8_t subj_slot;
+    uint8_t scratch_slot;
+    uint8_t payload_slot;
+    size_t exit_patches[32];
+    size_t n_exit = 0;
+    size_t fail_patches[8];
+    int nfp = 0;
+    int i;
+
+    if (!n || n->kind != NODE_MATCH) {
+        compile_fail(c, "internal: match");
+        return;
+    }
+
+    subj_slot = c->next_slot++;
+    scratch_slot = c->next_slot++;
+    payload_slot = c->next_slot++;
+    if (c->next_slot > 255) {
+        compile_fail(c, "too many locals");
+        return;
+    }
+    if (c->chunk->nlocals < c->next_slot) {
+        c->chunk->nlocals = c->next_slot;
+    }
+    c->local_names[subj_slot] = NULL;
+    c->local_names[scratch_slot] = NULL;
+    c->local_names[payload_slot] = NULL;
+
+    compile_expr(c, AS_MATCH(n).subject);
+    if (c->error) {
+        return;
+    }
+    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+    chunk_emit_u8(c->chunk, subj_slot);
+
+    for (a = AS_MATCH(n).arms; a && !c->error; a = a->next) {
+        AstNode *arm = a->item;
+        AstNode *pat;
+        AstNode *guard;
+        AstNode *body;
+        size_t arm_start;
+        size_t jmp_out;
+        size_t p;
+
+        if (!arm || arm->kind != NODE_MATCH_ARM) {
+            continue;
+        }
+        pat = AS_MATCH_ARM(arm).pattern;
+        guard = AS_MATCH_ARM(arm).guard;
+        body = AS_MATCH_ARM(arm).body;
+
+        arm_start = c->chunk->len;
+        for (i = 0; i < nfp; i++) {
+            int16_t rel = (int16_t)((int64_t)arm_start - (int64_t)(fail_patches[i] + 3u));
+            chunk_patch_u16(c->chunk, fail_patches[i] + 1u, (uint16_t)rel);
+        }
+        nfp = 0;
+
+        p = emit_match_pat_test(c, pat, subj_slot, scratch_slot, payload_slot);
+        if (c->error) {
+            return;
+        }
+        if (p != 0) {
+            if (nfp >= (int)(sizeof(fail_patches) / sizeof(fail_patches[0]))) {
+                compile_fail(c, "too many match failure patches");
+                return;
+            }
+            fail_patches[nfp++] = p;
+        }
+
+        compile_pat_emit_binds(c, pat, subj_slot, scratch_slot);
+        if (c->error) {
+            return;
+        }
+
+        if (guard) {
+            size_t at_gf;
+            compile_expr(c, guard);
+            if (c->error) {
+                return;
+            }
+            at_gf = c->chunk->len;
+            chunk_emit_u8(c->chunk, OP_POP_JUMP_IF_FALSE);
+            chunk_emit_u16(c->chunk, 0);
+            if (nfp >= (int)(sizeof(fail_patches) / sizeof(fail_patches[0]))) {
+                compile_fail(c, "too many match failure patches");
+                return;
+            }
+            fail_patches[nfp++] = at_gf;
+        }
+
+        if (body->kind == NODE_BLOCK) {
+            compile_block_as_value(c, body);
+        } else {
+            compile_expr(c, body);
+        }
+        if (c->error) {
+            return;
+        }
+        jmp_out = c->chunk->len;
+        chunk_emit_u8(c->chunk, OP_JUMP);
+        chunk_emit_u16(c->chunk, 0);
+        if (n_exit >= sizeof(exit_patches) / sizeof(exit_patches[0])) {
+            compile_fail(c, "too many match arms");
+            return;
+        }
+        exit_patches[n_exit++] = jmp_out;
+    }
+
+    if (nfp > 0) {
+        size_t abort_ip = c->chunk->len;
+        Value zv;
+        int zix;
+        for (i = 0; i < nfp; i++) {
+            int16_t rel = (int16_t)((int64_t)abort_ip - (int64_t)(fail_patches[i] + 3u));
+            chunk_patch_u16(c->chunk, fail_patches[i] + 1u, (uint16_t)rel);
+        }
+        nfp = 0;
+        zv.kind = VAL_INT;
+        zv.as.i = 0;
+        zix = chunk_add_constant(c->chunk, zv);
+        if (zix < 0) {
+            compile_fail(c, "out of memory");
+            return;
+        }
+        chunk_emit_u8(c->chunk, OP_PUSH_CONST);
+        chunk_emit_u16(c->chunk, (uint16_t)zix);
+    }
+
+    {
+        size_t end_ip = c->chunk->len;
+        size_t j;
+        for (j = 0; j < n_exit; j++) {
+            size_t k = exit_patches[j];
+            chunk_patch_u16(c->chunk, k + 1u, (uint16_t)(end_ip - (k + 3u)));
         }
     }
 }
@@ -903,6 +1345,12 @@ static void compile_expr(Ctx *c, AstNode *n) {
         case NODE_LIT_BOOL:
             chunk_emit_u8(c->chunk, AS_LIT_BOOL(n).value ? OP_PUSH_TRUE : OP_PUSH_FALSE);
             return;
+        case NODE_LIT_NONE: {
+            Value v;
+            v.kind = VAL_NONE;
+            emit_push_const_value(c, v);
+            return;
+        }
         case NODE_BLOCK:
             compile_block_as_value(c, n);
             return;
@@ -1028,6 +1476,9 @@ static void compile_expr(Ctx *c, AstNode *n) {
             return;
         case NODE_IF:
             compile_if_expr(c, n);
+            return;
+        case NODE_MATCH:
+            compile_match_expr(c, n);
             return;
         case NODE_LAMBDA:
             compile_lambda(c, n);
@@ -1384,11 +1835,16 @@ static void compile_expr(Ctx *c, AstNode *n) {
         }
         case NODE_METHOD_CALL: {
             const char *mname = AS_METHOD_CALL(n).method;
-            int fidx = fn_name_to_index(c->program, mname);
+            int fidx;
             AstNode *mfn;
             size_t expect;
             size_t nargs;
             AstList *arg;
+            if (AS_METHOD_CALL(n).resolved_fn) {
+                fidx = bc_fn_decl_index(c->program, AS_METHOD_CALL(n).resolved_fn);
+            } else {
+                fidx = fn_name_to_index(c->program, mname);
+            }
             if (fidx < 0) {
                 compile_fail(c, "unknown method in bytecode");
                 return;

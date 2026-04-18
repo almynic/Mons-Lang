@@ -102,6 +102,21 @@ static const char *expect_ident_copy(Parser *p) {
     return s;
 }
 
+/* After `Type::`, variant names may be identifiers or the keyword `None` (lexed as TOK_NONE). */
+static const char *expect_enum_variant_name(Parser *p) {
+    Token *t = peek(p);
+    if (t && t->kind == TOK_NONE) {
+        const char *s = ast_copy_string("None", 4);
+        if (!s) {
+            parser_error(p, t, "out of memory");
+            return NULL;
+        }
+        p->i++;
+        return s;
+    }
+    return expect_ident_copy(p);
+}
+
 static bool ident_text_is(const char *s, const char *lit) {
     return s && strcmp(s, lit) == 0;
 }
@@ -513,6 +528,94 @@ static AstNode *parse_return_after_kw(Parser *p, Token *t_ret) {
     return n;
 }
 
+static AstNode *parse_try_after_kw(Parser *p, Token *t_try) {
+    AstNode *body;
+    AstList *catches = NULL;
+    AstNode *finally_body = NULL;
+    AstNode *n;
+
+    body = parse_block(p);
+    if (p->error || !body) {
+        return NULL;
+    }
+    while (match(p, TOK_CATCH)) {
+        AstNode *cl;
+        const char *vname;
+        AstNode *ty;
+        AstNode *cbody;
+
+        expect(p, TOK_LPAREN, "'(' after catch");
+        if (p->error) {
+            return NULL;
+        }
+        vname = expect_ident_copy(p);
+        if (p->error || !vname) {
+            return NULL;
+        }
+        expect(p, TOK_COLON, "':' in catch binding");
+        if (p->error) {
+            return NULL;
+        }
+        ty = parse_type(p);
+        if (p->error || !ty) {
+            return NULL;
+        }
+        expect(p, TOK_RPAREN, "')' after catch binding");
+        if (p->error) {
+            return NULL;
+        }
+        cbody = parse_block(p);
+        if (p->error || !cbody) {
+            return NULL;
+        }
+        cl = ast_alloc(NODE_CATCH_CLAUSE, tok_loc(p, t_try));
+        if (!cl) {
+            parser_error(p, t_try, "out of memory");
+            return NULL;
+        }
+        AS_CATCH(cl).var = vname;
+        AS_CATCH(cl).type = ty;
+        AS_CATCH(cl).body = cbody;
+        catches = ast_list_append(catches, cl);
+        if (!catches) {
+            parser_error(p, t_try, "out of memory");
+            return NULL;
+        }
+    }
+    if (match(p, TOK_FINALLY)) {
+        finally_body = parse_block(p);
+        if (p->error || !finally_body) {
+            return NULL;
+        }
+    }
+    n = ast_alloc(NODE_TRY, tok_loc(p, t_try));
+    if (!n) {
+        parser_error(p, t_try, "out of memory");
+        return NULL;
+    }
+    AS_TRY(n).body = body;
+    AS_TRY(n).catch_clauses = catches;
+    AS_TRY(n).finally_body = finally_body;
+    return n;
+}
+
+static AstNode *parse_throw_after_kw(Parser *p, Token *t_throw) {
+    AstNode *e;
+    AstNode *n;
+
+    e = parse_expr(p);
+    if (p->error || !e) {
+        return NULL;
+    }
+    n = ast_alloc(NODE_THROW, tok_loc(p, t_throw));
+    if (!n) {
+        parser_error(p, t_throw, "out of memory");
+        return NULL;
+    }
+    AS_THROW(n).expr = e;
+    return n;
+}
+
 static AstNode *parse_for_after_kw(Parser *p, Token *t_for) {
     const char *var = expect_ident_copy(p);
     if (p->error || !var) {
@@ -562,8 +665,12 @@ static AstNode *parse_stmt(Parser *p) {
         return parse_for_after_kw(p, t0);
     }
     if (t0->kind == TOK_TRY) {
-        parser_error(p, t0, "try/catch not implemented yet");
-        return NULL;
+        p->i++;
+        return parse_try_after_kw(p, t0);
+    }
+    if (t0->kind == TOK_THROW) {
+        p->i++;
+        return parse_throw_after_kw(p, t0);
     }
 
     parser_error(p, t0, "expected statement");
@@ -571,7 +678,7 @@ static AstNode *parse_stmt(Parser *p) {
 }
 
 static bool stmt_starts(TokenKind k) {
-    return k == TOK_LET || k == TOK_RETURN || k == TOK_FOR || k == TOK_TRY;
+    return k == TOK_LET || k == TOK_RETURN || k == TOK_FOR || k == TOK_TRY || k == TOK_THROW;
 }
 
 static AstNode *parse_block(Parser *p) {
@@ -1085,6 +1192,397 @@ static AstNode *make_binary(AstNode *left, BinOp op, AstNode *right) {
     return n;
 }
 
+static AstNode *make_pat_or(Parser *p, AstNode *left, AstNode *right) {
+    AstNode *n = ast_alloc(NODE_PAT_OR, left->loc);
+    if (!n) {
+        parser_error(p, peek(p), "out of memory");
+        return NULL;
+    }
+    (void)p;
+    AS_PAT_OR(n).left = left;
+    AS_PAT_OR(n).right = right;
+    return n;
+}
+
+static AstNode *wrap_pat_literal(Parser *p, AstNode *lit) {
+    AstNode *n = ast_alloc(NODE_PAT_LITERAL, lit->loc);
+    if (!n) {
+        parser_error(p, peek(p), "out of memory");
+        return NULL;
+    }
+    AS_PAT_LIT(n).lit = lit;
+    return n;
+}
+
+static AstNode *parse_pattern(Parser *p);
+
+static AstNode *parse_pattern_atom(Parser *p) {
+    Token *t = peek(p);
+    if (!t) {
+        parser_error(p, prev(p), "expected pattern");
+        return NULL;
+    }
+
+    if (t->kind == TOK_TRUE || t->kind == TOK_FALSE) {
+        p->i++;
+        {
+            AstNode *lit = ast_alloc(NODE_LIT_BOOL, tok_loc(p, t));
+            if (!lit) {
+                parser_error(p, t, "out of memory");
+                return NULL;
+            }
+            AS_LIT_BOOL(lit).value = (t->kind == TOK_TRUE);
+            return wrap_pat_literal(p, lit);
+        }
+    }
+    if (t->kind == TOK_NONE) {
+        p->i++;
+        {
+            AstNode *lit = ast_alloc(NODE_LIT_NONE, tok_loc(p, t));
+            if (!lit) {
+                parser_error(p, t, "out of memory");
+                return NULL;
+            }
+            return wrap_pat_literal(p, lit);
+        }
+    }
+    if (t->kind == TOK_INT_LIT) {
+        p->i++;
+        {
+            AstNode *lit = parse_int_literal(p, t);
+            if (p->error || !lit) {
+                return NULL;
+            }
+            return wrap_pat_literal(p, lit);
+        }
+    }
+    if (t->kind == TOK_FLOAT_LIT || t->kind == TOK_DOUBLE_LIT) {
+        parser_error(p, t, "float/double patterns not supported yet");
+        return NULL;
+    }
+    if (t->kind == TOK_STRING_LIT) {
+        p->i++;
+        {
+            AstNode *lit = parse_string_literal(p, t);
+            if (p->error || !lit) {
+                return NULL;
+            }
+            return wrap_pat_literal(p, lit);
+        }
+    }
+
+    if (t->kind == TOK_IDENT) {
+        const char *nm = expect_ident_copy(p);
+        if (p->error || !nm) {
+            return NULL;
+        }
+        if (strcmp(nm, "_") == 0) {
+            AstNode *w = ast_alloc(NODE_PAT_WILDCARD, tok_loc(p, t));
+            if (!w) {
+                parser_error(p, t, "out of memory");
+                return NULL;
+            }
+            return w;
+        }
+        if (check(p, TOK_PATH_SEP)) {
+            const char *tn = nm;
+            p->i++;
+            {
+                const char *vn = expect_enum_variant_name(p);
+                AstList *flds = NULL;
+                if (p->error || !vn) {
+                    return NULL;
+                }
+                if (match(p, TOK_LPAREN)) {
+                    if (!check(p, TOK_RPAREN)) {
+                        do {
+                            AstNode *sub = parse_pattern(p);
+                            if (p->error || !sub) {
+                                return NULL;
+                            }
+                            flds = ast_list_append(flds, sub);
+                            if (!flds) {
+                                parser_error(p, peek(p), "out of memory");
+                                return NULL;
+                            }
+                        } while (match(p, TOK_COMMA));
+                    }
+                    expect(p, TOK_RPAREN, "')' after enum pattern fields");
+                    if (p->error) {
+                        return NULL;
+                    }
+                }
+                {
+                    AstNode *en = ast_alloc(NODE_PAT_ENUM, tok_loc(p, t));
+                    if (!en) {
+                        parser_error(p, t, "out of memory");
+                        return NULL;
+                    }
+                    AS_PAT_ENUM(en).type_name = tn;
+                    AS_PAT_ENUM(en).variant = vn;
+                    AS_PAT_ENUM(en).fields = flds;
+                    return en;
+                }
+            }
+        }
+        if (check(p, TOK_LBRACE) && ident_looks_like_struct_type_name(nm)) {
+            AstList *fields = NULL;
+            bool rest = false;
+            p->i++;
+            while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+                const char *fnm = expect_ident_copy(p);
+                if (p->error || !fnm) {
+                    return NULL;
+                }
+                if (match(p, TOK_COLON)) {
+                    AstNode *sub = parse_pattern(p);
+                    AstNode *pf;
+                    if (p->error || !sub) {
+                        return NULL;
+                    }
+                    pf = ast_alloc(NODE_PAT_FIELD, tok_loc(p, t));
+                    if (!pf) {
+                        parser_error(p, t, "out of memory");
+                        return NULL;
+                    }
+                    AS_PAT_FIELD(pf).field = fnm;
+                    AS_PAT_FIELD(pf).pattern = sub;
+                    fields = ast_list_append(fields, pf);
+                } else {
+                    AstNode *pf = ast_alloc(NODE_PAT_FIELD, tok_loc(p, t));
+                    if (!pf) {
+                        parser_error(p, t, "out of memory");
+                        return NULL;
+                    }
+                    AS_PAT_FIELD(pf).field = fnm;
+                    AS_PAT_FIELD(pf).pattern = NULL;
+                    fields = ast_list_append(fields, pf);
+                }
+                if (!fields) {
+                    parser_error(p, peek(p), "out of memory");
+                    return NULL;
+                }
+                if (match(p, TOK_COMMA)) {
+                    continue;
+                }
+                break;
+            }
+            if (match(p, TOK_DOT_DOT)) {
+                rest = true;
+            }
+            expect(p, TOK_RBRACE, "'}' after struct pattern");
+            if (p->error) {
+                return NULL;
+            }
+            {
+                AstNode *st = ast_alloc(NODE_PAT_STRUCT, tok_loc(p, t));
+                if (!st) {
+                    parser_error(p, t, "out of memory");
+                    return NULL;
+                }
+                AS_PAT_STRUCT(st).name = nm;
+                AS_PAT_STRUCT(st).field_pats = fields;
+                AS_PAT_STRUCT(st).rest = rest;
+                return st;
+            }
+        }
+        {
+            AstNode *b = ast_alloc(NODE_PAT_BIND, tok_loc(p, t));
+            if (!b) {
+                parser_error(p, t, "out of memory");
+                return NULL;
+            }
+            AS_PAT_BIND(b).name = nm;
+            AS_PAT_BIND(b).is_mut = false;
+            return b;
+        }
+    }
+
+    if (t->kind == TOK_LPAREN) {
+        p->i++;
+        {
+            AstNode *inner = parse_pattern(p);
+            if (p->error || !inner) {
+                return NULL;
+            }
+            if (match(p, TOK_COMMA)) {
+                AstList *els = ast_list_append(NULL, inner);
+                if (!els) {
+                    parser_error(p, t, "out of memory");
+                    return NULL;
+                }
+                while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+                    AstNode *el = parse_pattern(p);
+                    if (p->error || !el) {
+                        return NULL;
+                    }
+                    els = ast_list_append(els, el);
+                    if (!els) {
+                        parser_error(p, peek(p), "out of memory");
+                        return NULL;
+                    }
+                    if (!match(p, TOK_COMMA)) {
+                        break;
+                    }
+                }
+                expect(p, TOK_RPAREN, "')' after tuple pattern");
+                if (p->error) {
+                    return NULL;
+                }
+                {
+                    AstNode *tu = ast_alloc(NODE_PAT_TUPLE, tok_loc(p, t));
+                    if (!tu) {
+                        parser_error(p, t, "out of memory");
+                        return NULL;
+                    }
+                    AS_PAT_TUPLE(tu).elements = els;
+                    return tu;
+                }
+            }
+            expect(p, TOK_RPAREN, "')' after pattern");
+            if (p->error) {
+                return NULL;
+            }
+            return inner;
+        }
+    }
+
+    if (t->kind == TOK_LBRACKET) {
+        p->i++;
+        {
+            AstList *els = NULL;
+            if (!check(p, TOK_RBRACKET)) {
+                do {
+                    AstNode *el = parse_pattern(p);
+                    if (p->error || !el) {
+                        return NULL;
+                    }
+                    els = ast_list_append(els, el);
+                    if (!els) {
+                        parser_error(p, peek(p), "out of memory");
+                        return NULL;
+                    }
+                } while (match(p, TOK_COMMA));
+            }
+            expect(p, TOK_RBRACKET, "']' after array pattern");
+            if (p->error) {
+                return NULL;
+            }
+            {
+                AstNode *ar = ast_alloc(NODE_PAT_ARRAY, tok_loc(p, t));
+                if (!ar) {
+                    parser_error(p, t, "out of memory");
+                    return NULL;
+                }
+                AS_PAT_ARRAY(ar).elements = els;
+                return ar;
+            }
+        }
+    }
+
+    parser_error(p, t, "expected pattern");
+    return NULL;
+}
+
+static AstNode *parse_pattern(Parser *p) {
+    AstNode *lhs = parse_pattern_atom(p);
+    if (p->error || !lhs) {
+        return NULL;
+    }
+    while (match(p, TOK_PIPE)) {
+        AstNode *rhs = parse_pattern_atom(p);
+        if (p->error || !rhs) {
+            return NULL;
+        }
+        lhs = make_pat_or(p, lhs, rhs);
+        if (p->error || !lhs) {
+            return NULL;
+        }
+    }
+    return lhs;
+}
+
+static AstNode *parse_match_arm(Parser *p) {
+    AstNode *pat = parse_pattern(p);
+    AstNode *guard = NULL;
+    AstNode *body;
+    AstNode *arm;
+    Token *t0 = peek(p);
+
+    if (p->error || !pat) {
+        return NULL;
+    }
+    if (match(p, TOK_IF)) {
+        guard = parse_expr(p);
+        if (p->error || !guard) {
+            return NULL;
+        }
+    }
+    expect(p, TOK_FAT_ARROW, "'=>' in match arm");
+    if (p->error) {
+        return NULL;
+    }
+    if (check(p, TOK_LBRACE)) {
+        body = parse_block(p);
+    } else {
+        body = parse_expr(p);
+        if (p->error || !body) {
+            return NULL;
+        }
+        expect(p, TOK_COMMA, "comma after match arm expression");
+    }
+    if (p->error || !body) {
+        return NULL;
+    }
+    arm = ast_alloc(NODE_MATCH_ARM, pat->loc);
+    if (!arm) {
+        parser_error(p, t0 ? t0 : peek(p), "out of memory");
+        return NULL;
+    }
+    AS_MATCH_ARM(arm).pattern = pat;
+    AS_MATCH_ARM(arm).guard = guard;
+    AS_MATCH_ARM(arm).body = body;
+    return arm;
+}
+
+static AstNode *parse_match_expr(Parser *p, Token *t_match) {
+    AstNode *subj;
+    AstList *arms = NULL;
+    AstNode *n;
+
+    subj = parse_expr(p);
+    if (p->error || !subj) {
+        return NULL;
+    }
+    expect(p, TOK_LBRACE, "'{' after match subject");
+    if (p->error) {
+        return NULL;
+    }
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        AstNode *a = parse_match_arm(p);
+        if (p->error || !a) {
+            return NULL;
+        }
+        arms = ast_list_append(arms, a);
+        if (!arms) {
+            parser_error(p, peek(p), "out of memory");
+            return NULL;
+        }
+    }
+    expect(p, TOK_RBRACE, "'}' after match arms");
+    if (p->error) {
+        return NULL;
+    }
+    n = ast_alloc(NODE_MATCH, tok_loc(p, t_match));
+    if (!n) {
+        parser_error(p, t_match, "out of memory");
+        return NULL;
+    }
+    AS_MATCH(n).subject = subj;
+    AS_MATCH(n).arms = arms;
+    return n;
+}
+
 /* Returns false if token is not a binary infix operator at expression level. */
 static bool pratt_infix(TokenKind k, int *left_prec, BinOp *bop, bool *is_assign) {
     *is_assign = false;
@@ -1235,6 +1733,17 @@ static AstNode *parse_atom(Parser *p) {
             return NULL;
         }
         return parse_postfix(p, n);
+    }
+
+    if (t->kind == TOK_MATCH) {
+        p->i++;
+        {
+            AstNode *n = parse_match_expr(p, t);
+            if (p->error || !n) {
+                return NULL;
+            }
+            return parse_postfix(p, n);
+        }
     }
 
     if (t->kind == TOK_LBRACE) {
@@ -1535,6 +2044,130 @@ static AstNode *parse_const_decl_rest(Parser *p, bool is_pub, Token *t_const) {
     return n;
 }
 
+static AstNode *parse_use_decl_rest(Parser *p, Token *t_use) {
+    Token *t0;
+    const char *part;
+    size_t cap = 64;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    AstList *items = NULL;
+    bool glob = false;
+    AstNode *n;
+
+    if (!buf) {
+        parser_error(p, t_use, "out of memory");
+        return NULL;
+    }
+    buf[0] = '\0';
+
+    t0 = peek(p);
+    part = expect_ident_copy(p);
+    if (p->error || !part) {
+        free(buf);
+        return NULL;
+    }
+    {
+        size_t pn = strlen(part);
+        while (len + pn + 1u > cap) {
+            size_t ncap = cap * 2u;
+            char *nb = (char *)realloc(buf, ncap);
+            if (!nb) {
+                free(buf);
+                parser_error(p, t_use, "out of memory");
+                return NULL;
+            }
+            buf = nb;
+            cap = ncap;
+        }
+        memcpy(buf + len, part, pn);
+        len += pn;
+        buf[len] = '\0';
+    }
+
+    while (match(p, TOK_PATH_SEP)) {
+        if (match(p, TOK_LBRACE)) {
+            if (match(p, TOK_STAR)) {
+                glob = true;
+            } else {
+                do {
+                    Token *ti = peek(p);
+                    const char *it = expect_ident_copy(p);
+                    AstNode *id;
+                    if (p->error || !it) {
+                        free(buf);
+                        return NULL;
+                    }
+                    id = ast_alloc(NODE_IDENT, tok_loc(p, ti ? ti : t_use));
+                    if (!id) {
+                        free(buf);
+                        parser_error(p, t_use, "out of memory");
+                        return NULL;
+                    }
+                    AS_IDENT(id).name = it;
+                    items = ast_list_append(items, id);
+                    if (!items) {
+                        free(buf);
+                        parser_error(p, t_use, "out of memory");
+                        return NULL;
+                    }
+                } while (match(p, TOK_COMMA));
+            }
+            expect(p, TOK_RBRACE, "'}' after use tree");
+            if (p->error) {
+                free(buf);
+                return NULL;
+            }
+            break;
+        }
+        part = expect_ident_copy(p);
+        if (p->error || !part) {
+            free(buf);
+            return NULL;
+        }
+        {
+            size_t pn = strlen(part);
+            while (len + 2u + pn + 1u > cap) {
+                size_t ncap = cap * 2u;
+                char *nb = (char *)realloc(buf, ncap);
+                if (!nb) {
+                    free(buf);
+                    parser_error(p, t_use, "out of memory");
+                    return NULL;
+                }
+                buf = nb;
+                cap = ncap;
+            }
+            buf[len++] = ':';
+            buf[len++] = ':';
+            memcpy(buf + len, part, pn);
+            len += pn;
+            buf[len] = '\0';
+        }
+    }
+
+    expect(p, TOK_SEMI, "';' after use declaration");
+    if (p->error) {
+        free(buf);
+        return NULL;
+    }
+
+    n = ast_alloc(NODE_USE_DECL, tok_loc(p, t0 ? t0 : t_use));
+    if (!n) {
+        free(buf);
+        parser_error(p, t_use, "out of memory");
+        return NULL;
+    }
+    AS_USE_DECL(n).path = ast_copy_string(buf, len);
+    AS_USE_DECL(n).items = items;
+    AS_USE_DECL(n).glob = glob;
+    free(buf);
+    if (!AS_USE_DECL(n).path) {
+        parser_error(p, t_use, "out of memory");
+        return NULL;
+    }
+    return n;
+}
+
 static void impl_names_free(const char *trait_name, const char *struct_name) {
     if (trait_name) {
         free((void *)trait_name);
@@ -1683,6 +2316,133 @@ static AstNode *parse_fn_decl_rest(Parser *p, bool is_pub, Token *t_fn) {
     return n;
 }
 
+static AstNode *parse_trait_fn_sig_after_kw(Parser *p, Token *t_fn) {
+    const char *name = expect_ident_copy(p);
+    AstList *generics;
+    AstList *params;
+    AstNode *ret_type = NULL;
+    AstNode *n;
+
+    if (p->error || !name) {
+        return NULL;
+    }
+    generics = parse_generic_params(p);
+    if (p->error) {
+        return NULL;
+    }
+    if (generics) {
+        parser_error(p, t_fn, "generic trait methods are not supported yet");
+        return NULL;
+    }
+
+    expect(p, TOK_LPAREN, "'(' after function name");
+    if (p->error) {
+        return NULL;
+    }
+    params = parse_param_list(p);
+    if (p->error) {
+        return NULL;
+    }
+    expect(p, TOK_RPAREN, "')' after parameters");
+    if (p->error) {
+        return NULL;
+    }
+
+    if (match(p, TOK_ARROW)) {
+        ret_type = parse_type(p);
+        if (p->error || !ret_type) {
+            return NULL;
+        }
+    }
+
+    expect(p, TOK_SEMI, "';' after trait method signature");
+    if (p->error) {
+        return NULL;
+    }
+
+    n = ast_alloc(NODE_TRAIT_FN_SIG, tok_loc(p, t_fn));
+    if (!n) {
+        parser_error(p, t_fn, "out of memory");
+        return NULL;
+    }
+    AS_TRAIT_FN_SIG(n).name = name;
+    AS_TRAIT_FN_SIG(n).generic_params = NULL;
+    AS_TRAIT_FN_SIG(n).params = params;
+    AS_TRAIT_FN_SIG(n).ret_type = ret_type;
+    return n;
+}
+
+static AstNode *parse_trait_decl_rest(Parser *p, bool is_pub, Token *t_trait) {
+    const char *name = expect_ident_copy(p);
+    AstList *generics;
+    AstList *items = NULL;
+    AstNode *n;
+
+    if (p->error || !name) {
+        return NULL;
+    }
+
+    generics = parse_generic_params(p);
+    if (p->error) {
+        return NULL;
+    }
+    if (generics) {
+        parser_error(p, t_trait, "generic traits are not supported yet");
+        return NULL;
+    }
+
+    if (match(p, TOK_COLON)) {
+        parser_error(p, peek(p), "trait super-bounds are not supported yet");
+        return NULL;
+    }
+
+    expect(p, TOK_LBRACE, "'{' to start trait body");
+    if (p->error) {
+        return NULL;
+    }
+
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        Token *tf = peek(p);
+        if (!tf || tf->kind != TOK_FN) {
+            parser_error(p, tf ? tf : prev(p), "expected fn in trait body");
+            break;
+        }
+        p->i++;
+        {
+            AstNode *it = parse_trait_fn_sig_after_kw(p, tf);
+            if (p->error || !it) {
+                break;
+            }
+            items = ast_list_append(items, it);
+            if (!items) {
+                parser_error(p, tf, "out of memory");
+                break;
+            }
+        }
+    }
+
+    if (p->error) {
+        return NULL;
+    }
+
+    expect(p, TOK_RBRACE, "'}' after trait body");
+    if (p->error) {
+        return NULL;
+    }
+
+    n = ast_alloc(NODE_TRAIT_DECL, tok_loc(p, t_trait));
+    if (!n) {
+        parser_error(p, t_trait, "out of memory");
+        return NULL;
+    }
+    AS_TRAIT_DECL(n).name = name;
+    AS_TRAIT_DECL(n).generic_params = NULL;
+    AS_TRAIT_DECL(n).super_traits = NULL;
+    AS_TRAIT_DECL(n).items = items;
+    AS_TRAIT_DECL(n).is_pub = is_pub;
+    return n;
+}
+
 static AstNode *parse_top_level_decl(Parser *p) {
     bool is_pub = false;
     if (match(p, TOK_PUB)) {
@@ -1704,9 +2464,23 @@ static AstNode *parse_top_level_decl(Parser *p) {
         return parse_struct_decl_rest(p, is_pub, t);
     }
 
+    if (t->kind == TOK_TRAIT) {
+        p->i++;
+        return parse_trait_decl_rest(p, is_pub, t);
+    }
+
     if (t->kind == TOK_IMPL) {
         p->i++;
         return parse_impl_decl_rest(p, is_pub, t);
+    }
+
+    if (t->kind == TOK_USE) {
+        p->i++;
+        if (is_pub) {
+            parser_error(p, t, "`pub use` is not supported yet");
+            return NULL;
+        }
+        return parse_use_decl_rest(p, t);
     }
 
     if (t->kind == TOK_CONST) {
@@ -1715,7 +2489,7 @@ static AstNode *parse_top_level_decl(Parser *p) {
     }
 
     if (is_pub) {
-        parser_error(p, t, "expected fn, struct, or impl after pub");
+        parser_error(p, t, "expected fn, struct, trait, or impl after pub");
         return NULL;
     }
 

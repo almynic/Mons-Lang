@@ -1,5 +1,5 @@
-// Stdlib core — prepended before VM smoke tests (see main.c --vm-test).
-// Keep functions within the bytecode subset (no if, &&, composites, …).
+// Stdlib core — import with `use stdlib::core;` (same `use` resolver as user code).
+// Keep surface aligned with what bytecode compiles today (`if`, int ops, calls, …).
 
 pub fn twice(n: int) -> int {
     n + n
@@ -7,4 +7,54 @@ pub fn twice(n: int) -> int {
 
 pub fn add(a: int, b: int) -> int {
     a + b
+}
+
+pub fn sub(a: int, b: int) -> int {
+    a - b
+}
+
+pub fn mul(a: int, b: int) -> int {
+    a * b
+}
+
+pub fn square(n: int) -> int {
+    n * n
+}
+
+pub fn neg(n: int) -> int {
+    0 - n
+}
+
+pub fn abs_i(n: int) -> int {
+    if n < 0 {
+        neg(n)
+    } else {
+        n
+    }
+}
+
+pub fn min_int(a: int, b: int) -> int {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn max_int(a: int, b: int) -> int {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+pub fn clamp_i(v: int, lo: int, hi: int) -> int {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
 }

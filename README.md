@@ -39,13 +39,15 @@ Mons prefers expressions over statements, immutability over mutation, and compos
 | Error handling | `Result[T, E]` + `match` or `try/catch/finally` |
 | Metaprogramming | AST macros, runtime reflection, compile-time codegen |
 | Implementation | Written in C, zero dependencies |
-| Status | **Phase 1** interpreter complete; **Phase 2** stack bytecode covers the **2A–2C** milestones below; **Phase 2+** remains for register VM tuning, tracing GC, and full language surface (`./mons --vm-test`, [DESIGN.md](DESIGN.md#phase-2--bytecode-vm-staged)) |
+| Status | **Phase 1** tree-walk complete; **Phase 2 (closed scope)** complete — stack bytecode **2A–2C**, `use`, traits (MVP), hybrid GC, stdlib slice, **`--vm-test`** / **`--reflect`** ([DESIGN.md — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete)). **Phase 2+** / **Phase 3** prep: `try` on bytecode, macros, richer `use`, full stdlib, register VM, etc. |
 
-The **language tour** below describes the *target* Mons design. The **reference implementation** covers **Phase 1** end-to-end (lex → parse → typecheck → eval) plus a **bytecode** pipeline for a large subset. **`./mons path.mons`** typechecks a file; **`./mons -i`** runs the REPL; **`make test`** runs typecheck smokes, **`--reflect`**, and **`--vm-test`**. Still **Phase 2+** for many items: **`match`**, **`try`/`catch`**, **trait** `impl`, **generics**, **macros**, a full **stdlib**, **`use`**, **tracing GC**, and any remaining bytecode gaps versus the interpreter (e.g. **`match`** / **`try`** on the VM).
+The **language tour** below describes the *target* Mons design. The **reference implementation** delivers **Phase 1** (lex → parse → typecheck → eval) plus **Phase 2** bytecode for the [closed scope in DESIGN](DESIGN.md#phase-2-closed-scope-complete). **`./mons path.mons`** typechecks a file; **`./mons -i`** runs the REPL; **`make test`** runs typecheck fixtures, **`--reflect`**, and **`--vm-test`**. **Phase 2+** highlights: **`try`/`catch`/`throw` on bytecode**, **generic** traits/impls, **AST macros**, selective/glob **`use`**, and bytecode **`match`** gaps versus the interpreter (see **Bytecode vs interpreter**). **Trait `impl Trait for Type`** (non-generic) uses **`resolved_fn`** on both backends. **`use module::path;`** resolves recursively with duplicate suppression and cycle detection.
 
 ---
 
 ## Language tour
+
+The tour describes the *target* surface. Some snippets name builtins that are not wired in this repo yet (`println`, `sqrt`, range syntax like `0..10`). The shipped stdlib slice lives in **`stdlib/core.mons`** and is loaded with **`use stdlib::core;`** (same module resolver as other `use` paths).
 
 ### Primitives and bindings
 
@@ -95,15 +97,12 @@ pub fn square(n: int) -> int { n * n }
 // if as expression
 let label = if score > 90 { "A" } else if score > 75 { "B" } else { "C" }
 
-// for is iterator-based
-for item in collection {
+// for is iterator-based (today: arrays and homogeneous tuples)
+for item in [1, 2, 3] {
     process(item)
 }
 
-// range iteration (via stdlib)
-for i in 0..10 {
-    println(i)
-}
+// numeric ranges / println-style I/O are future stdlib / builtins — see `stdlib/core.mons` for int helpers (`twice`, `add`, `clamp_i`, …) via `use stdlib::core`
 ```
 
 ---
@@ -333,18 +332,18 @@ Built-in generic types:
 | **Evaluator** | `eval.c` — tree-walk with environments, refcounted composite values (`[T]`, tuples, structs) |
 | **REPL + driver** | `repl.c`, `main.c` — `-i` / `--repl` (accumulated session, re-typecheck each input); no-arg demo; file path = typecheck only |
 | **Bytecode (2A–2B)** | `bytecode.c`, `compile.c`, `vm.c` — stack `Chunk`, `BcProgram` (layouts + **symbol pool**), **`OP_ARRAY_NEW`** / **`OP_TUPLE_NEW`** / **`OP_ARRAY_LEN`** / **`OP_INDEX_INT`**, **`for`** (arrays + **homogeneous tuples**), **float/double** arithmetic + ordered compares, structs + field opcodes, **`impl`** in chunk index; **signed** jump offsets; `vm_run_program(...)`; `--vm-test` |
-| **Reflection + stdlib (2C)** | `reflection.c`, `stdlib/core.mons` — **`--reflect`** public API summary; VM smoke prepends stdlib + `tests/vm_smoke.mons` |
+| **Reflection + stdlib (2C)** | `reflection.c`, `stdlib/core.mons` — **`--reflect`** public API summary; **`--vm-test`** loads `tests/vm_smoke.mons`, which **`use`s** stdlib through the normal resolver |
 
 **Language surface that typechecks and runs end-to-end** (non-exhaustive):
 
 - Top-level **`struct`** (non-generic), **`fn`** / **`pub fn`**, **`const`** / **`pub const`** (initializer type-checked and evaluated at startup into a global value environment).
 - Types: primitives, **`[T]`**, tuples **`(A, B)`**, named struct types, **`Option` / `Result`** in type syntax (limited use in expressions).
 - Statements: **`let`**, **`return`**, expression statements, **`for x in expr`** where *expr* is an array or a **homogeneous** tuple.
-- Expressions: literals, **`if`**, blocks, arithmetic / comparisons / **`&&`** / **`||`**, assignment to locals, **calls**, **method calls** `r.method(args)` desugared to `method(r, args)` when the callee’s first parameter is named **`self`**.
+- Expressions: literals, **`if`**, **`match`** (see bytecode notes), blocks, arithmetic / comparisons / **`&&`** / **`||`**, assignment to locals, **calls**, **method calls** `r.method(args)` desugared to `method(r, args)` when the callee’s first parameter is named **`self`**.
 - **Struct literals** `Type { f: e, }`, **field access**, and **struct update** `Type { f: v, ..base, }` (spread must appear after explicit fields in the current parser).
 - **Arrays** and **tuples**: literals, indexing; tuple indices must be **integer literals** in the type checker.
 
-**Bytecode vs interpreter:** the tree-walk path still leads on **`match`**, **`try` / `catch`**, and other features not yet lowered to opcodes. **Bytecode** covers **ints/bools**, **`float`/`double`**, **array** and **tuple** literals, **`for`** over arrays and **homogeneous** tuples, **`a[i]`** / **`t[i]`** (tuple index must be an **int literal** in the type checker), **structs** (literals, **`..base`**, field access), **inherent `impl`**, **lambdas** (including inferred parameter types and empty-parameter **`||`** form) + upvalues, **calls**, **`if`/`else`** (including **`return`** in a branch), **`&&`/`||`**, **`!`**, assignment, and **`stdlib/core.mons`** for **`--vm-test`**. **Trait** `impl`, **`use`**, **macros**, and **tracing GC** remain open — see **DESIGN**. **`--reflect`** lists **`pub`** API shapes from the AST.
+**Bytecode vs interpreter:** the tree-walk path still leads on **`try` / `catch`** and a few **`match`** pattern forms. **`match`** is lowered for **literals**, **`_`**, **binds**, **`Option::None`**, **`Option::Some` with a wildcard or bind inner pattern** (payload is a **single-element tuple** at runtime), and **struct patterns** with field binds; the bytecode compiler rejects **`|`** (or-patterns), **`Option::Some` with a literal inner pattern**, and nested tests inside **`Some`** for now. **Bytecode** otherwise covers **ints/bools**, **`float`/`double`**, **array** and **tuple** literals, **`for`** over arrays and **homogeneous** tuples, **`a[i]`** / **`t[i]`** (tuple index must be an **int literal** in the type checker), **structs** (literals, **`..base`**, field access), **inherent `impl`** and **trait** `impl Trait for Type` (static dispatch via **`resolved_fn`**), **lambdas** (including inferred parameter types and empty-parameter **`||`** form) + upvalues, **`use`**, **calls**, **`if`/`else`** (including **`return`** in a branch), **`&&`/`||`**, **`!`**, assignment, **`match`** as above, **hybrid refcount + tracing GC**, and **`stdlib/core.mons`** pulled in by **`tests/vm_smoke.mons`** for **`--vm-test`**. **AST macros** and fuller module features remain future — see **DESIGN**. **`--reflect`** lists **`pub`** API shapes from the AST.
 
 ---
 
@@ -358,13 +357,13 @@ Phase 1 — Tree-walk interpreter (complete)
   ✓ Tree-walk evaluator (eval.c)
   ✓ Driver: embedded demo, optional source file, `make test` (tests/smoke.mons)
   ✓ Interactive REPL (`./mons -i`, `repl.c`)
-  ○ AST macro expansion (Phase 2 prep)
-  ○ Standard library (Phase 2)
+  ○ AST macro expansion (Phase 2+)
+  ✓ Stdlib slice (`stdlib/core.mons` via `use`); ○ full standard library (Phase 2+)
 
-Phase 2 — Bytecode VM
+Phase 2 — Bytecode VM *(closed scope — see DESIGN)*
   ✓ Phase 2A: stack bytecode + `Chunk`, compiler subset, stack VM, `./mons --vm-test`
-  ✓ Phase 2B: **calls**, **array** + **tuple** literals, **`for`** (arrays + homogeneous tuples), **`[]`** on both, **`float`/`double`** on VM, **structs** + **spread**, **inherent `impl`**, **field access**; **still open:** optional **register** VM, **tracing GC**
-  ✓ Phase 2C: **reflection** (`--reflect`), **stdlib** prelude, **closures** in interpreter and **lambdas** (inferred params + empty-param form) + upvalues on bytecode
+  ✓ Phase 2B: **calls**, **array** + **tuple** literals, **`for`** (arrays + homogeneous tuples), **`[]`** on both, **`float`/`double`** on VM, **structs** + **spread**, **inherent `impl`**, **trait `impl`**, **field access**; **Phase 2+:** optional **register** VM tuning
+  ✓ Phase 2C: **reflection** (`--reflect`), **stdlib** via **`use`**, **hybrid tracing GC**, **closures** in interpreter and **lambdas** (inferred params + empty-param form) + upvalues on bytecode
 
 Phase 3 — Native code (optional)
   ▸ C code emission or LLVM IR backend
@@ -383,11 +382,12 @@ mons-lang/
 ├── mons_grammar.ebnf       # Formal grammar (EBNF)
 ├── Makefile
 ├── stdlib/
-│   └── core.mons           # Prepended for `./mons --vm-test`
+│   └── core.mons           # `use stdlib::core;` — int helpers (bytecode-safe subset)
 ├── tests/
 │   ├── smoke.mons          # `make test` — parse + typecheck (`bump(K)`)
+│   ├── stdlib_core.mons    # `make test` — `use stdlib::core` typecheck
 │   ├── closure.mons        # `make test` — lambdas, captures, nested λ (typecheck)
-│   └── vm_smoke.mons       # With stdlib: VM smoke (closures, control flow, structs + `impl`, …)
+│   └── vm_smoke.mons       # `--vm-test`: imports stdlib, VM smokes (closures, `for`, traits, …)
 │
 ├── include/
 │   ├── ast.h               # AST nodes, lists, arena API
@@ -416,7 +416,7 @@ mons-lang/
     └── ast_print.c         # Debug AST printer
 ```
 
-*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — stack VM, multi-chunk calls, closures (inferred params + empty-param lambdas), arrays/tuples/`[]`/`for` (incl. homogeneous tuples), floats/doubles, structs + `..base` + inherent `impl`, field opcodes. Phase 2C: `reflection.c`, `stdlib/core.mons`. Later: `use`, `match`, `try` on VM, tracing GC — see **DESIGN**.)*
+*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — stack VM, multi-chunk calls, closures (inferred params + empty-param lambdas), arrays/tuples/`[]`/`for` (incl. homogeneous tuples), floats/doubles, structs + `..base` + inherent/trait `impl`, field opcodes, subset **`match`**, hybrid refcount+tracing GC. Phase 2C: `reflection.c`, `stdlib/core.mons` via **`use`**. **Phase 2** is **closed** for this slice — see [DESIGN — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete); **Phase 2+**: richer `use`, fuller **`match`** on VM, **`try`** on VM.)*
 
 ---
 
@@ -437,13 +437,13 @@ make test           # typecheck smoke.mons + `--reflect` + bytecode VM smoke (`-
 | *(no arguments)* | Embedded sample: print AST, typecheck, run several **`eval_call_by_name`** smoke tests (`add`, `mid`, …). |
 | **`./mons path.mons`** | Read file, lex, parse, typecheck. Prints `type check: ok` on success. No eval, no AST dump. |
 | **`./mons -i`** or **`./mons --repl`** | Interactive REPL: session grows with each successful input; full program is re-parsed and re-typechecked each time. Non–top-level snippets are wrapped in `fn __monsrepl_N() { … }` and evaluated; see [LANGUAGE.md — REPL](LANGUAGE.md#repl). |
-| **`./mons --vm-test`** | Concatenate **`stdlib/core.mons`** + **`tests/vm_smoke.mons`**, typecheck, bytecode-compile, run a fixed table of VM entry checks (closures including inferred params, control flow, **`for`**, arrays/tuples + **`[]`**, floats, structs + spread, …); see **`DESIGN`**. |
+| **`./mons --vm-test`** | Load **`tests/vm_smoke.mons`** through the `use` resolver (which pulls **`stdlib/core.mons`**), typecheck, bytecode-compile, and run a fixed VM smoke table (closures including inferred params, control flow, **`for`**, arrays/tuples + **`[]`**, floats, structs + spread, traits, …); see **`DESIGN`**. |
 | **`./mons --reflect path.mons`** | Lex, parse, typecheck, then print a line-oriented summary of **`pub struct`**, **`pub fn`**, **`pub const`** (for tooling). |
 | **`./mons -h`** / **`--help`** | Usage summary. |
 
 **REPL tips:** end a line with **`\\`** to continue on the next line, or leave **`{`** unclosed until the matching **`}`** (prompt shows `...`). Commands: **`:help`**, **`:clear`**, **`:quit`** (or EOF).
 
-**CI:** `make test` runs `./mons tests/smoke.mons`, `./mons --reflect tests/smoke.mons`, and `./mons --vm-test`; all must exit 0.
+**CI:** `make test` runs `./mons tests/smoke.mons`, `./mons tests/stdlib_core.mons`, `./mons tests/closure.mons`, `./mons tests/trait_impl.mons`, negative checks on `tests/use_missing.mons` and `tests/use_cycle_a.mons`, `./mons --reflect tests/smoke.mons`, and `./mons --vm-test`; all must exit as specified.
 
 ---
 

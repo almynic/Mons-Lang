@@ -150,6 +150,7 @@ static TokenKind keyword_kind(const char *start, size_t len) {
         {"try", TOK_TRY},
         {"catch", TOK_CATCH},
         {"finally", TOK_FINALLY},
+        {"throw", TOK_THROW},
         {"true", TOK_TRUE},
         {"false", TOK_FALSE},
         {"None", TOK_NONE},
@@ -367,6 +368,7 @@ const char *token_kind_name(TokenKind kind) {
         case TOK_TRY: return "TRY";
         case TOK_CATCH: return "CATCH";
         case TOK_FINALLY: return "FINALLY";
+        case TOK_THROW: return "THROW";
         case TOK_TRUE: return "TRUE";
         case TOK_FALSE: return "FALSE";
         case TOK_NONE: return "NONE";

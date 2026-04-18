@@ -109,11 +109,13 @@ stmt            = let_stmt
                 | return_stmt
                 | expr_stmt
                 | for_stmt
-                | try_stmt ;
+                | try_stmt
+                | throw_stmt ;
 
 let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
 return_stmt     = "return" [ expr ] ";" ;
 expr_stmt       = expr ";" ;
+throw_stmt      = "throw" expr ";" ;
 
 for_stmt        = "for" IDENT "in" expr block ;     (* iterator-based *)
 

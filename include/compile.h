@@ -32,4 +32,7 @@ void compile_program_result_free(CompileProgramResult *r);
 /* Index of `name` among `fn` declarations only, or -1. */
 int bc_fn_index(AstNode *program, const char *name);
 
+/* Linear chunk index of a specific `NODE_FN_DECL` (top-level or impl method), or -1. */
+int bc_fn_decl_index(AstNode *program, AstNode *fn_decl);
+
 #endif /* MONS_COMPILE_H */

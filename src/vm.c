@@ -28,6 +28,10 @@ static bool values_equal_scalar(const Value *a, const Value *b) {
             return a->as.f == b->as.f;
         case VAL_DOUBLE:
             return a->as.d == b->as.d;
+        case VAL_NONE:
+            return true;
+        case VAL_STRING:
+            return a->as.s && b->as.s && strcmp(a->as.s, b->as.s) == 0;
         default:
             return false;
     }
@@ -546,15 +550,17 @@ int_op_done:
                         err = 1;
                         break;
                     }
-                    cl = (ValClosure *)calloc(1, sizeof(ValClosure));
+                    cl = value_closure_new();
                     cells = nup > 0 ? (Value *)calloc(nup, sizeof(Value)) : NULL;
                     if (nup > 0 && !cells) {
-                        free(cl);
+                        Value dead;
+                        dead.kind = VAL_CLOSURE;
+                        dead.as.closure = cl;
+                        value_release(&dead);
                         vm_fail(&out, "vm: out of memory");
                         err = 1;
                         break;
                     }
-                    cl->refc = 1;
                     cl->lambda = NULL;
                     cl->cap_names = NULL;
                     cl->cap_vals = cells;
@@ -606,13 +612,12 @@ int_op_done:
                         err = 1;
                         break;
                     }
-                    cl = (ValClosure *)calloc(1, sizeof(ValClosure));
+                    cl = value_closure_new();
                     if (!cl) {
                         vm_fail(&out, "vm: out of memory");
                         err = 1;
                         break;
                     }
-                    cl->refc = 1;
                     cl->lambda = NULL;
                     cl->cap_names = NULL;
                     cl->cap_vals = NULL;
@@ -649,11 +654,16 @@ int_op_done:
                     }
                     vals = nf > 0 ? (Value *)malloc(nf * sizeof(Value)) : NULL;
                     fnames_copy = nf > 0 ? (const char **)malloc(nf * sizeof(char *)) : NULL;
-                    vs = (ValStruct *)malloc(sizeof(ValStruct));
+                    vs = value_struct_new();
                     if ((nf > 0 && (!vals || !fnames_copy)) || !vs) {
                         free(vals);
                         free(fnames_copy);
-                        free(vs);
+                        if (vs) {
+                            Value dv;
+                            dv.kind = VAL_STRUCT;
+                            dv.as.st = vs;
+                            value_release(&dv);
+                        }
                         vm_fail(&out, "vm: out of memory");
                         err = 1;
                         break;
@@ -667,11 +677,15 @@ int_op_done:
                         }
                         free(vals);
                         free(fnames_copy);
-                        free(vs);
+                        {
+                            Value dv;
+                            dv.kind = VAL_STRUCT;
+                            dv.as.st = vs;
+                            value_release(&dv);
+                        }
                         break;
                     }
                     memcpy(fnames_copy, L->field_names, nf * sizeof(char *));
-                    vs->refc = 1;
                     vs->type_name = L->type_name;
                     vs->n = nf;
                     vs->field_names = fnames_copy;
@@ -754,18 +768,22 @@ int_op_done:
                         err = 1;
                         break;
                     }
-                    seq = (ValSeq *)calloc(1, sizeof(ValSeq));
+                    seq = value_seq_new();
                     if (!seq) {
                         vm_fail(&out, "vm: out of memory");
                         err = 1;
                         break;
                     }
-                    seq->refc = 1;
                     seq->len = (size_t)nf;
                     if (nf > 0) {
                         seq->items = (Value *)malloc((size_t)nf * sizeof(Value));
                         if (!seq->items) {
-                            free(seq);
+                            {
+                                Value ds;
+                                ds.kind = VAL_ARRAY;
+                                ds.as.seq = seq;
+                                value_release(&ds);
+                            }
                             vm_fail(&out, "vm: out of memory");
                             err = 1;
                             break;
@@ -778,7 +796,12 @@ int_op_done:
                                 value_release(&seq->items[j]);
                             }
                             free(seq->items);
-                            free(seq);
+                            {
+                                Value ds;
+                                ds.kind = VAL_ARRAY;
+                                ds.as.seq = seq;
+                                value_release(&ds);
+                            }
                             break;
                         }
                     } else {
@@ -801,18 +824,22 @@ int_op_done:
                         err = 1;
                         break;
                     }
-                    seq = (ValSeq *)calloc(1, sizeof(ValSeq));
+                    seq = value_seq_new();
                     if (!seq) {
                         vm_fail(&out, "vm: out of memory");
                         err = 1;
                         break;
                     }
-                    seq->refc = 1;
                     seq->len = (size_t)nf;
                     if (nf > 0) {
                         seq->items = (Value *)malloc((size_t)nf * sizeof(Value));
                         if (!seq->items) {
-                            free(seq);
+                            {
+                                Value ds;
+                                ds.kind = VAL_TUPLE;
+                                ds.as.seq = seq;
+                                value_release(&ds);
+                            }
                             vm_fail(&out, "vm: out of memory");
                             err = 1;
                             break;
@@ -825,7 +852,12 @@ int_op_done:
                                 value_release(&seq->items[j]);
                             }
                             free(seq->items);
-                            free(seq);
+                            {
+                                Value ds;
+                                ds.kind = VAL_TUPLE;
+                                ds.as.seq = seq;
+                                value_release(&ds);
+                            }
                             break;
                         }
                     } else {
@@ -1109,6 +1141,18 @@ double_op_done:
                     }
                     break;
                 }
+                case OP_SWAP: {
+                    Value t;
+                    if (sp < 2u) {
+                        vm_fail(&out, "vm: swap needs two stack values");
+                        err = 1;
+                        break;
+                    }
+                    t = stack[sp - 2u];
+                    stack[sp - 2u] = stack[sp - 1u];
+                    stack[sp - 1u] = t;
+                    break;
+                }
                 case OP_CALL_CLOSURE: {
                     uint8_t na = chunk->code[ip++];
                     Value *argv;
@@ -1282,6 +1326,9 @@ vm_cleanup:
     if (!out.ok) {
         value_release(&out.result);
         out.result.kind = VAL_VOID;
+        value_gc_collect(NULL, 0);
+    } else {
+        value_gc_collect(&out.result, 1);
     }
 
     return out;
