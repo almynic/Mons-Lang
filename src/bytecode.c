@@ -10,7 +10,9 @@ void chunk_init(Chunk *c) {
     c->constants = NULL;
     c->nconst = 0;
     c->capconst = 0;
+    c->nparams = 0;
     c->nlocals = 0;
+    c->nupvalues = 0;
 }
 
 void chunk_free(Chunk *c) {
@@ -30,7 +32,9 @@ void chunk_free(Chunk *c) {
     c->constants = NULL;
     c->nconst = 0;
     c->capconst = 0;
+    c->nparams = 0;
     c->nlocals = 0;
+    c->nupvalues = 0;
 }
 
 int chunk_add_constant(Chunk *c, Value v) {
@@ -78,4 +82,12 @@ void chunk_emit_u16(Chunk *c, uint16_t u) {
     }
     c->code[c->len++] = (uint8_t)(u & 0xffu);
     c->code[c->len++] = (uint8_t)((u >> 8) & 0xffu);
+}
+
+void chunk_patch_u16(Chunk *c, size_t at, uint16_t v) {
+    if (!c || at + 2u > c->len) {
+        return;
+    }
+    c->code[at] = (uint8_t)(v & 0xffu);
+    c->code[at + 1u] = (uint8_t)((v >> 8) & 0xffu);
 }

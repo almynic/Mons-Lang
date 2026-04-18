@@ -8,8 +8,14 @@
 #include <stddef.h>
 
 typedef struct {
-    Chunk  *chunks;
-    size_t  nchunks;
+    Chunk           *chunks;
+    size_t           nchunks;
+    BcStructLayout  *structs;
+    size_t           nstructs;
+    /* Interned C strings (e.g. field names for OP_GET_FIELD_NAMED); owned by compile result. */
+    char           **symbol_pool;
+    size_t           nsymbols;
+    size_t           symbol_cap;
 } BcProgram;
 
 typedef struct {
