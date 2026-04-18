@@ -643,7 +643,7 @@ static void compile_for_stmt(Ctx *c, AstNode *st) {
     }
 }
 
-/* Block as a value (e.g. `if` branch): must end with a tail expression; no `return`. */
+/* Block as a value (e.g. `if` branch): tail expression and/or `return` (early exit from the whole fn chunk). */
 static void compile_block_as_value(Ctx *c, AstNode *blk) {
     AstList *sl;
     if (!blk || blk->kind != NODE_BLOCK) {
@@ -678,7 +678,15 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
                 break;
             }
             case NODE_RETURN:
-                compile_fail(c, "return in branch block not supported in bytecode");
+                if (!AS_RETURN(st).value) {
+                    compile_fail(c, "bare return in branch block not supported in bytecode yet");
+                    return;
+                }
+                compile_expr(c, AS_RETURN(st).value);
+                if (c->error) {
+                    return;
+                }
+                chunk_emit_u8(c->chunk, OP_RETURN);
                 return;
             case NODE_EXPR_STMT:
                 compile_expr(c, AS_EXPR_STMT(st).expr);
@@ -701,11 +709,11 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
     if (c->error) {
         return;
     }
-    if (!AS_BLOCK(blk).tail_expr) {
-        compile_fail(c, "branch block needs a tail expression");
-        return;
+    if (AS_BLOCK(blk).tail_expr) {
+        compile_expr(c, AS_BLOCK(blk).tail_expr);
+    } else {
+        compile_fail(c, "branch block needs a tail expression or a return statement");
     }
-    compile_expr(c, AS_BLOCK(blk).tail_expr);
 }
 
 static void compile_if_expr(Ctx *c, AstNode *n) {

@@ -190,7 +190,7 @@ let n = {
 
 ### `if`
 
-`if` is an expression: each branch is a block (or another expression as parsed). `else if` chains and final `else` follow the grammar.
+`if` is an expression: each branch is a block (or another expression as parsed). `else if` chains and final `else` follow the grammar. A branch may use **`return`** to exit the enclosing function (or **`||`** lambda body); the type checker requires branch types to unify with each other and with the function’s return type when **`return`** appears.
 
 ```mons
 let ok = if a + b * 2 == 0 && true || false {

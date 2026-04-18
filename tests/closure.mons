@@ -24,6 +24,10 @@ pub fn infer_two_params_ok() -> int {
     add(3, 4)
 }
 
+pub fn if_return_ok() -> int {
+    if true { return 3; } else { 4 }
+}
+
 pub fn ctrl_flow_ok() -> int {
     if true && !false { 1 } else { 0 }
 }

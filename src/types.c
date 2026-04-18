@@ -1422,21 +1422,50 @@ static Type *infer_block(Checker *c, AstNode *block_node) {
     c->current_env = &inner;
 
     AstList *s;
+    Type *from_returns = NULL;
+
     for (s = AS_BLOCK(block_node).stmts; s; s = s->next) {
         check_stmt(c, s->item);
         if (c->error) {
             break;
         }
+        if (s->item->kind == NODE_RETURN && AS_RETURN(s->item).value) {
+            Type *rt = infer_expr(c, AS_RETURN(s->item).value);
+            if (c->error) {
+                break;
+            }
+            if (!from_returns) {
+                from_returns = rt;
+            } else if (!unify(c, from_returns, rt, AS_RETURN(s->item).value->loc)) {
+                break;
+            }
+        }
     }
 
-    Type *tail_ty = ty_void;
     if (!c->error && AS_BLOCK(block_node).tail_expr) {
-        tail_ty = infer_expr(c, AS_BLOCK(block_node).tail_expr);
+        Type *tail_ty = infer_expr(c, AS_BLOCK(block_node).tail_expr);
+        if (c->error) {
+            env_free_head(&inner);
+            c->current_env = inner.parent;
+            return NULL;
+        }
+        if (from_returns) {
+            if (!unify(c, from_returns, tail_ty, AS_BLOCK(block_node).tail_expr->loc)) {
+                env_free_head(&inner);
+                c->current_env = inner.parent;
+                return NULL;
+            }
+        } else {
+            from_returns = tail_ty;
+        }
     }
 
     env_free_head(&inner);
     c->current_env = inner.parent;
-    return tail_ty;
+    if (c->error) {
+        return NULL;
+    }
+    return from_returns ? from_returns : ty_void;
 }
 
 static bool register_fn_sig(Checker *c, AstNode *fn) {
