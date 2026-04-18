@@ -169,6 +169,19 @@ static void ast_print_node(const AstNode *n, int indent) {
                    AS_STRUCT_FIELD(n).name);
             ast_print_node(AS_STRUCT_FIELD(n).type, indent + 2);
             break;
+        case NODE_IMPL_DECL:
+            if (AS_IMPL_DECL(n).trait_name) {
+                printf("IMPL %s%s for %s\n",
+                       AS_IMPL_DECL(n).is_pub ? "pub " : "",
+                       AS_IMPL_DECL(n).trait_name,
+                       AS_IMPL_DECL(n).struct_name);
+            } else {
+                printf("IMPL %s%s\n",
+                       AS_IMPL_DECL(n).is_pub ? "pub " : "",
+                       AS_IMPL_DECL(n).struct_name);
+            }
+            print_list(AS_IMPL_DECL(n).methods, indent + 2, ast_print_node);
+            break;
         case NODE_CONST_DECL:
             printf("CONST %s%s\n", AS_CONST_DECL(n).is_pub ? "pub " : "", AS_CONST_DECL(n).name);
             ast_print_node(AS_CONST_DECL(n).type, indent + 2);

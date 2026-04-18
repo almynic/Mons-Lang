@@ -112,7 +112,9 @@ void value_release(Value *v) {
                     value_release(&cl->cap_vals[i]);
                 }
                 free(cl->cap_vals);
-                free(cl->cap_names);
+                if (cl->cap_names) {
+                    free(cl->cap_names);
+                }
                 free(cl);
             }
             break;
@@ -247,7 +249,17 @@ void value_fprint(FILE *fp, const Value *v) {
             fprintf(fp, "}");
             break;
         case VAL_CLOSURE:
-            fprintf(fp, "<closure>");
+            if (v->as.closure) {
+                if (v->as.closure->is_bytecode) {
+                    fprintf(fp, "<bc closure chunk=%u ncap=%zu>",
+                            (unsigned)v->as.closure->bc_chunk_idx,
+                            v->as.closure->ncap);
+                } else {
+                    fprintf(fp, "<closure>");
+                }
+            } else {
+                fprintf(fp, "<closure>");
+            }
             break;
     }
 }
@@ -1298,6 +1310,8 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
                 }
                 cl->refc = 1;
                 cl->lambda = n;
+                cl->is_bytecode = false;
+                cl->bc_chunk_idx = 0;
                 cl->ncap = nc;
                 cl->cap_names = (const char **)malloc(nc * sizeof(const char *));
                 cl->cap_vals = (Value *)malloc(nc * sizeof(Value));
@@ -1377,8 +1391,8 @@ static void eval_stmt(EvalCtx *ctx, AstNode *stmt) {
                 if (ctx->error) {
                     return;
                 }
-                if (iter_v.kind != VAL_ARRAY) {
-                    eval_fail(ctx, "for-in expects an array value");
+                if (iter_v.kind != VAL_ARRAY && iter_v.kind != VAL_TUPLE) {
+                    eval_fail(ctx, "for-in expects an array or tuple value");
                     value_release(&iter_v);
                     return;
                 }
@@ -1458,8 +1472,15 @@ static Value eval_lambda_body(EvalCtx *ctx, AstNode *body) {
 
 /* Captures + parameters, then lambda body (block or single expr). */
 static Value eval_invoke_closure(EvalCtx *ctx, ValClosure *cl, const Value *args, size_t nargs) {
-    AstNode *lam = cl->lambda;
-    size_t nparam = ast_list_len(AS_LAMBDA(lam).params);
+    AstNode *lam;
+    size_t nparam;
+
+    if (!cl->lambda || cl->is_bytecode) {
+        eval_fail(ctx, "internal: not an interpreter closure");
+        return val_void();
+    }
+    lam = cl->lambda;
+    nparam = ast_list_len(AS_LAMBDA(lam).params);
     EvalEnv capf = { NULL, ctx->env };
     EvalEnv argf = { NULL, &capf };
     AstList *pl;

@@ -134,6 +134,15 @@ typedef enum {
     PRIM_INT, PRIM_FLOAT, PRIM_DOUBLE, PRIM_BOOL, PRIM_STRING
 } PrimKind;
 
+/* After typecheck: guides bytecode for numeric/bool primitives (unset otherwise). */
+typedef enum {
+    AST_BC_TY_NONE = 0,
+    AST_BC_TY_INT,
+    AST_BC_TY_FLOAT,
+    AST_BC_TY_DOUBLE,
+    AST_BC_TY_BOOL
+} AstBcTypeTag;
+
 /* ════════════════════════════════════════════════════════════════
  *  Central AstNode
  * ════════════════════════════════════════════════════════════════ */
@@ -141,6 +150,7 @@ typedef enum {
 typedef struct AstNode {
     NodeKind kind;
     SrcLoc   loc;
+    AstBcTypeTag bc_ty;
 
     union {
 
@@ -211,7 +221,9 @@ typedef struct AstNode {
             const char *struct_name;
             const char *trait_name;  /* NULL → inherent impl */
             AstList    *generic_params;
-            AstList    *methods;     /* list of NODE_FN_DECL */
+            AstList    *type_generic_params; /* after target type name, or NULL */
+            AstList    *methods;             /* list of NODE_FN_DECL */
+            bool        is_pub;              /* `pub impl` — visibility metadata */
         } impl_decl;
 
         /* ── NODE_MACRO_DECL ──────────────────────────────────── */

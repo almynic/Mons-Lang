@@ -527,6 +527,7 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
     }
 }
 
+static Type *infer_expr_impl(Checker *c, AstNode *n);
 static Type *infer_expr(Checker *c, AstNode *n);
 
 static Type *infer_block(Checker *c, AstNode *block);
@@ -601,6 +602,7 @@ static Type *struct_field_type(Type *st, const char *fname, size_t *out_index) {
 
 static AstNode *lookup_fn_decl(Checker *c, const char *name) {
     AstList *d;
+    AstList *m;
     if (!c->program || c->program->kind != NODE_PROGRAM) {
         return NULL;
     }
@@ -608,11 +610,53 @@ static AstNode *lookup_fn_decl(Checker *c, const char *name) {
         if (d->item->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(d->item).name, name) == 0) {
             return d->item;
         }
+        if (d->item->kind == NODE_IMPL_DECL) {
+            for (m = AS_IMPL_DECL(d->item).methods; m; m = m->next) {
+                if (m->item && m->item->kind == NODE_FN_DECL &&
+                    strcmp(AS_FN_DECL(m->item).name, name) == 0) {
+                    return m->item;
+                }
+            }
+        }
     }
     return NULL;
 }
 
+static void assign_bc_tag(AstNode *n, Type *t) {
+    if (!n) {
+        return;
+    }
+    n->bc_ty = AST_BC_TY_NONE;
+    if (!t) {
+        return;
+    }
+    switch (t->kind) {
+        case TY_INT:
+            n->bc_ty = AST_BC_TY_INT;
+            break;
+        case TY_FLOAT:
+            n->bc_ty = AST_BC_TY_FLOAT;
+            break;
+        case TY_DOUBLE:
+            n->bc_ty = AST_BC_TY_DOUBLE;
+            break;
+        case TY_BOOL:
+            n->bc_ty = AST_BC_TY_BOOL;
+            break;
+        default:
+            break;
+    }
+}
+
 static Type *infer_expr(Checker *c, AstNode *n) {
+    Type *t = infer_expr_impl(c, n);
+    if (!c->error && n && t) {
+        assign_bc_tag(n, prune(t));
+    }
+    return t;
+}
+
+static Type *infer_expr_impl(Checker *c, AstNode *n) {
     if (!n) {
         checker_fail(c, (SrcLoc){0}, "internal: null expr");
         return NULL;
@@ -1116,18 +1160,42 @@ static void check_stmt(Checker *c, AstNode *stmt) {
                     return;
                 }
                 it = prune(it);
-                if (it->kind != TY_ARRAY) {
-                    checker_fail(c, stmt->loc, "for-in expects an array value");
-                    return;
+                if (it->kind == TY_ARRAY) {
+                    Type *elem = it->as.inner;
+                    Env inner = { .head = NULL, .parent = c->current_env };
+                    env_insert(&inner, AS_FOR(stmt).var, elem);
+                    c->current_env = &inner;
+                    (void)infer_block(c, AS_FOR(stmt).body);
+                    env_free_head(&inner);
+                    c->current_env = inner.parent;
+                    break;
                 }
-                Type *elem = it->as.inner;
-                Env inner = { .head = NULL, .parent = c->current_env };
-                env_insert(&inner, AS_FOR(stmt).var, elem);
-                c->current_env = &inner;
-                (void)infer_block(c, AS_FOR(stmt).body);
-                env_free_head(&inner);
-                c->current_env = inner.parent;
-                break;
+                if (it->kind == TY_TUPLE) {
+                    size_t i;
+                    Type *elem;
+                    if (it->as.tuple.nelems == 0) {
+                        checker_fail(c, stmt->loc, "for-in over empty tuple");
+                        return;
+                    }
+                    elem = prune(it->as.tuple.elems[0]);
+                    for (i = 1; i < it->as.tuple.nelems; i++) {
+                        if (!unify(c, elem, it->as.tuple.elems[i], stmt->loc)) {
+                            return;
+                        }
+                        elem = prune(elem);
+                    }
+                    {
+                        Env inner = { .head = NULL, .parent = c->current_env };
+                        env_insert(&inner, AS_FOR(stmt).var, elem);
+                        c->current_env = &inner;
+                        (void)infer_block(c, AS_FOR(stmt).body);
+                        env_free_head(&inner);
+                        c->current_env = inner.parent;
+                    }
+                    break;
+                }
+                checker_fail(c, stmt->loc, "for-in expects an array or homogeneous tuple");
+                return;
             }
         case NODE_TRY:
             checker_fail(c, stmt->loc, "try/catch not type-checked yet");
@@ -1205,6 +1273,65 @@ static bool register_fn_sig(Checker *c, AstNode *fn) {
         return false;
     }
     env_insert(c->global_env, AS_FN_DECL(fn).name, ft);
+    return true;
+}
+
+static bool register_impl_decl(Checker *c, AstNode *impl) {
+    const char *sn = AS_IMPL_DECL(impl).struct_name;
+    Type *st;
+    AstList *m;
+
+    if (AS_IMPL_DECL(impl).trait_name) {
+        checker_fail(c, impl->loc, "trait impl not supported yet");
+        return false;
+    }
+    if (AS_IMPL_DECL(impl).generic_params || AS_IMPL_DECL(impl).type_generic_params) {
+        checker_fail(c, impl->loc, "generic impl not supported yet");
+        return false;
+    }
+    st = env_lookup(c->global_env, sn);
+    if (!st || prune(st)->kind != TY_STRUCT) {
+        checker_fail(c, impl->loc, "impl target must be a struct type");
+        return false;
+    }
+    st = prune(st);
+
+    for (m = AS_IMPL_DECL(impl).methods; m; m = m->next) {
+        AstNode *fn = m->item;
+        AstList *pl;
+        AstNode *p0;
+        Type *pty;
+
+        if (!fn || fn->kind != NODE_FN_DECL) {
+            checker_fail(c, impl->loc, "impl body must contain functions");
+            return false;
+        }
+        pl = AS_FN_DECL(fn).params;
+        if (!pl || !pl->item) {
+            checker_fail(c, fn->loc, "impl method needs at least self parameter");
+            return false;
+        }
+        p0 = pl->item;
+        if (strcmp(AS_PARAM(p0).name, "self") != 0) {
+            checker_fail(c, p0->loc, "impl method first parameter must be named self");
+            return false;
+        }
+        if (!AS_PARAM(p0).type) {
+            checker_fail(c, p0->loc, "self parameter must have a type");
+            return false;
+        }
+        pty = ast_type_to_type(c, AS_PARAM(p0).type);
+        if (c->error) {
+            return false;
+        }
+        if (!unify(c, pty, st, p0->loc)) {
+            checker_fail(c, p0->loc, "self type must match impl struct");
+            return false;
+        }
+        if (!register_fn_sig(c, fn)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1377,7 +1504,7 @@ TypeCheckResult type_check_program(AstNode *program) {
             }
         }
     }
-    /* Pass 2: consts (typed) and fn signatures (no bodies). */
+    /* Pass 2: consts (typed), fn signatures, impl method signatures. */
     if (!chk.error) {
         for (d = AS_PROGRAM(program).decls; d; d = d->next) {
             if (d->item->kind == NODE_CONST_DECL) {
@@ -1388,6 +1515,10 @@ TypeCheckResult type_check_program(AstNode *program) {
                 if (!register_fn_sig(&chk, d->item)) {
                     break;
                 }
+            } else if (d->item->kind == NODE_IMPL_DECL) {
+                if (!register_impl_decl(&chk, d->item)) {
+                    break;
+                }
             } else if (d->item->kind != NODE_STRUCT_DECL) {
                 checker_fail(&chk, d->item->loc, "unsupported top-level declaration");
                 break;
@@ -1395,11 +1526,20 @@ TypeCheckResult type_check_program(AstNode *program) {
         }
     }
 
-    /* Pass 3: fn bodies (params + global parent). */
+    /* Pass 3: fn bodies (params + global parent), including impl methods. */
     if (!chk.error) {
         for (d = AS_PROGRAM(program).decls; d; d = d->next) {
             if (d->item->kind == NODE_FN_DECL) {
                 if (!check_fn_body(&chk, d->item)) {
+                    break;
+                }
+            } else if (d->item->kind == NODE_IMPL_DECL) {
+                AstList *m;
+                bool impl_ok = true;
+                for (m = AS_IMPL_DECL(d->item).methods; m && impl_ok; m = m->next) {
+                    impl_ok = check_fn_body(&chk, m->item);
+                }
+                if (!impl_ok) {
                     break;
                 }
             }

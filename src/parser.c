@@ -4,8 +4,9 @@
  * - Declarations / statements / types: classic recursive descent (expect, match).
  * - Expressions: Pratt parser (parse_expr_pratt) for precedence; atoms from parse_atom;
  *   then parse_postfix chains .field, .method(), [], (), and Type { } struct literals.
- * - Struct literal vs block: only Ident '{' is parsed as NODE_STRUCT_INIT if the name
- *   starts with an uppercase letter (so `for x in a {` is not `a { ... }`).
+ * - Struct literal vs block: Ident '{' is NODE_STRUCT_INIT only if the name looks like a
+ *   type (PascalCase: first char upper and either one char, or some lowercase later).
+ *   All-caps ids (e.g. const FLAG) do not consume `{`, so `if FLAG {` is not `FLAG { ... }`.
  */
 #include "parser.h"
 
@@ -755,6 +756,25 @@ enum {
 static AstNode *parse_atom(Parser *p);
 static AstNode *parse_expr_pratt(Parser *p, int min_prec);
 
+/* True if `name` should parse as `name { fields }` (struct init), not leave `{` for a block. */
+static bool ident_looks_like_struct_type_name(const char *name) {
+    size_t i;
+    size_t len;
+    if (!name || !name[0] || !isupper((unsigned char)name[0])) {
+        return false;
+    }
+    len = strlen(name);
+    if (len == 1u) {
+        return true;
+    }
+    for (i = 1u; name[i]; i++) {
+        if (islower((unsigned char)name[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static AstNode *parse_postfix(Parser *p, AstNode *n) {
     for (;;) {
         if (match(p, TOK_DOT)) {
@@ -850,10 +870,10 @@ static AstNode *parse_postfix(Parser *p, AstNode *n) {
             continue;
         }
 
-        /* Type names start with uppercase (Rust-style); `for x in a {` must not eat `{` as struct lit. */
+        /* PascalCase type names (Point, T); not ALL_CAPS consts (FLAG). `for x in a {` still safe (a lower). */
         if (n->kind == NODE_IDENT && check(p, TOK_LBRACE)) {
             const char *sname = AS_IDENT(n).name;
-            if (!sname[0] || !isupper((unsigned char)sname[0])) {
+            if (!ident_looks_like_struct_type_name(sname)) {
                 break;
             }
             p->i++;
@@ -1409,6 +1429,8 @@ static AstNode *parse_expr(Parser *p) {
     return parse_expr_pratt(p, 0);
 }
 
+static AstNode *parse_fn_decl_rest(Parser *p, bool is_pub, Token *t_fn);
+
 static AstNode *parse_struct_decl_rest(Parser *p, bool is_pub, Token *t_struct) {
     const char *name = expect_ident_copy(p);
     if (p->error || !name) {
@@ -1513,6 +1535,104 @@ static AstNode *parse_const_decl_rest(Parser *p, bool is_pub, Token *t_const) {
     return n;
 }
 
+static void impl_names_free(const char *trait_name, const char *struct_name) {
+    if (trait_name) {
+        free((void *)trait_name);
+        if (struct_name) {
+            free((void *)struct_name);
+        }
+    } else if (struct_name) {
+        free((void *)struct_name);
+    }
+}
+
+static AstNode *parse_impl_decl_rest(Parser *p, bool is_pub, Token *t_impl) {
+    AstList *gp_impl;
+    AstList *gp_type = NULL;
+    AstList *methods = NULL;
+    const char *trait_name = NULL;
+    const char *struct_name = NULL;
+    const char *name_a;
+    AstNode *n;
+
+    (void)t_impl;
+
+    gp_impl = parse_generic_params(p);
+    if (p->error) {
+        return NULL;
+    }
+
+    name_a = expect_ident_copy(p);
+    if (p->error || !name_a) {
+        return NULL;
+    }
+
+    if (match(p, TOK_FOR)) {
+        trait_name = name_a;
+        struct_name = expect_ident_copy(p);
+        if (p->error || !struct_name) {
+            impl_names_free(trait_name, NULL);
+            return NULL;
+        }
+    } else {
+        struct_name = name_a;
+    }
+
+    gp_type = parse_generic_params(p);
+    if (p->error) {
+        impl_names_free(trait_name, struct_name);
+        return NULL;
+    }
+
+    expect(p, TOK_LBRACE, "'{' to start impl body");
+    if (p->error) {
+        impl_names_free(trait_name, struct_name);
+        return NULL;
+    }
+
+    while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        bool mpub = match(p, TOK_PUB);
+        Token *t_fn = peek(p);
+        if (!t_fn || t_fn->kind != TOK_FN) {
+            parser_error(p, t_fn ? t_fn : prev(p), "expected fn in impl block");
+            break;
+        }
+        p->i++;
+        {
+            AstNode *f = parse_fn_decl_rest(p, mpub, t_fn);
+            if (p->error || !f) {
+                break;
+            }
+            methods = ast_list_append(methods, f);
+        }
+    }
+
+    if (p->error) {
+        impl_names_free(trait_name, struct_name);
+        return NULL;
+    }
+
+    expect(p, TOK_RBRACE, "'}' after impl body");
+    if (p->error) {
+        impl_names_free(trait_name, struct_name);
+        return NULL;
+    }
+
+    n = ast_alloc(NODE_IMPL_DECL, tok_loc(p, t_impl));
+    if (!n) {
+        parser_error(p, t_impl, "out of memory");
+        impl_names_free(trait_name, struct_name);
+        return NULL;
+    }
+    AS_IMPL_DECL(n).struct_name = struct_name;
+    AS_IMPL_DECL(n).trait_name = trait_name;
+    AS_IMPL_DECL(n).generic_params = gp_impl;
+    AS_IMPL_DECL(n).type_generic_params = gp_type;
+    AS_IMPL_DECL(n).methods = methods;
+    AS_IMPL_DECL(n).is_pub = is_pub;
+    return n;
+}
+
 static AstNode *parse_fn_decl_rest(Parser *p, bool is_pub, Token *t_fn) {
     const char *name = expect_ident_copy(p);
     if (p->error || !name) {
@@ -1584,13 +1704,18 @@ static AstNode *parse_top_level_decl(Parser *p) {
         return parse_struct_decl_rest(p, is_pub, t);
     }
 
+    if (t->kind == TOK_IMPL) {
+        p->i++;
+        return parse_impl_decl_rest(p, is_pub, t);
+    }
+
     if (t->kind == TOK_CONST) {
         p->i++;
         return parse_const_decl_rest(p, is_pub, t);
     }
 
     if (is_pub) {
-        parser_error(p, t, "expected fn or struct after pub");
+        parser_error(p, t, "expected fn, struct, or impl after pub");
         return NULL;
     }
 

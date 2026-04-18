@@ -59,10 +59,12 @@ struct ValStruct {
 
 struct ValClosure {
     size_t       refc;
-    AstNode     *lambda; /* NODE_LAMBDA — lives in program arena */
-    const char **cap_names;
+    AstNode     *lambda; /* interpreter: NODE_LAMBDA; NULL when is_bytecode */
+    const char **cap_names; /* interpreter only; NULL for bytecode */
     Value       *cap_vals;
     size_t       ncap;
+    bool         is_bytecode;
+    uint16_t     bc_chunk_idx; /* VM: body chunk index */
 };
 
 typedef struct {
