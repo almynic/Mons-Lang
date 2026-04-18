@@ -5,3 +5,33 @@ pub fn closure_ty_ok() -> int {
     let d = || x * 2;
     d()
 }
+
+pub fn nested_lambda_ok() -> int {
+    let outer = |a: int| {
+        let inner = |b: int| a + b;
+        inner(3)
+    };
+    outer(10)
+}
+
+pub fn ctrl_flow_ok() -> int {
+    if true && !false { 1 } else { 0 }
+}
+
+pub fn assign_ok() -> int {
+    let mut x = 1;
+    x = x + 4;
+    x
+}
+
+pub fn block_expr_ok() -> int {
+    let x = { let a = 6; a + a };
+    x
+}
+
+/* All-caps const + `if NAME {` must parse as cond, not struct literal (parser.c). */
+pub const SMOKE_FLAG: bool = true;
+
+pub fn if_allcaps_bool_cond() -> int {
+    if SMOKE_FLAG { 7 } else { 0 }
+}
