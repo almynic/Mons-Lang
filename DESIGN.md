@@ -16,6 +16,7 @@ A detailed specification of the language design, architecture, and implementatio
 - [Keyword reference](#keyword-reference)
 - [Implementation pipeline](#implementation-pipeline)
 - [Implementation phases](#implementation-phases)
+- [Phase 2 completion checklist](#phase-2-completion-checklist)
 - [File structure](#file-structure)
 - [Design decisions log](#design-decisions-log)
 
@@ -489,7 +490,7 @@ Build order:
 
 **Phase 1 milestone (reference implementation) — done:** the driver (`main.c`) lexes, parses, typechecks, and evaluates programs using the subset above — including **struct literals**, **field access**, **struct update** (`..base` after explicit fields), **array/tuple** literals and indexing, **`for`** over arrays, **top-level `const`** / **`pub const`** (values live in a global eval environment before any `fn` runs), **inherent-style methods** where `recv.m(args)` calls a top-level function whose first parameter is named `self`, **`./mons file.mons`** for typecheck-only runs, **`make test`** (`tests/smoke.mons`), and an **interactive REPL** (`./mons -i`, **`repl.c`**) that wraps non-declaration input in temporary functions for evaluation.
 
-**Beyond Phase 1 (design-doc parity, later phases):** closures/lambdas, `match`, `try`/`catch`, `impl` blocks and traits in the parser, generics on functions/structs, AST macros, and a standard library.
+**Beyond Phase 1 (still evolving):** the parser and type checker accept **inherent `impl Type { fn … }`** (no trait `impl` yet). **Bytecode** compiles **structs**, **method calls**, and **field access** for a subset (see Phase 2 below). Still largely future work: **`match`**, **`try`/`catch`**, **trait** `impl`, **generics**, AST **macros**, a full **standard library**, and **`use`**.
 
 ### Phase 2 — Bytecode VM (staged)
 
@@ -498,25 +499,55 @@ Phase 2 replaces (or complements) the tree-walk interpreter with a compact bytec
 #### Phase 2A — Stack bytecode + compiler subset *(in tree)*
 
 - **Bytecode** (`bytecode.h` / `bytecode.c`): opcodes, `Chunk` (code bytes + constant pool of `Value`).
-- **Compiler** (`compile.h` / `compile.c`): AST → bytecode for a **limited** surface: integer/bool literals, `+ - * / %`, comparisons on ints, unary `-`, locals (parameters + `let`), top-level **integer const** references (const initializer must be an int literal), blocks with tail expression, `return`, expression statements. **Not** compiled yet: `&&` / `||`, unary `!`, `if`, indirect/method calls, composites, floats, `for`, etc. (compiler reports an error).
-- **VM** (`vm.h` / `vm.c`): **stack** machine. Refcounting aligned with `eval.h` (`value_retain` / `value_release`). **`vm_run_chunk`** runs a single `Chunk` (no cross-chunk calls); see Phase 2B for multi-chunk execution.
-- **Driver**: `./mons --vm-test` concatenates **`stdlib/core.mons`** + **`tests/vm_smoke.mons`**, typechecks, compiles, runs entry **`smoke`** on the VM (prints `bytecode smoke() = 14` for `twice(K)`). Plain **`tests/smoke.mons`** is still typechecked alone in `make test`.
+- **Compiler** (`compile.h` / `compile.c`): AST → bytecode for a **limited** surface: integer/bool/**float**/**double** literals (constant pool), **`{ ... }` block expressions** (value position → **`compile_block_as_value`**), `+ - * / %` (numeric kinds per type-checker tags on **`AstNode.bc_ty`**), comparisons (ints plus **`OP_*_FLOAT`** / **`OP_*_DOUBLE`** for ordered compares; **`OP_EQ`** / **`OP_NE`** use scalar equality for floats/doubles), unary `-` / `!`, short-circuit **`&&`** / **`||`**, **`if` / `else` / `else if`** value expressions (requires **`else`**; branch blocks use a **tail expression**; no `return` inside branches yet), locals (parameters + `let`), **assignment** to locals and **upvalue cells** (`=` expression value; **`OP_DUP`** + **`OP_STORE_LOCAL`** / **`OP_SET_UPVALUE`**), top-level **`pub const`** for **int** (pool) and **bool** (`true`/`false` opcodes), blocks with tail expression, `return`, expression statements, **typed lambdas** (`OP_CLOSURE`, upvalues, `OP_CALL_CLOSURE`), **`OP_PUSH_FN`**, **struct literals** (**`OP_STRUCT_NEW`** + **`BcStructLayout`**), **field access** (**`OP_GET_FIELD`** when the receiver is a tracked local struct, else **`OP_GET_FIELD_NAMED`** via a **`BcProgram.symbol_pool`** of interned field names), **method calls** (**`OP_CALL`** with receiver first). Jumps: **`OP_JUMP`**, **`OP_POP_JUMP_IF_FALSE`**, **`OP_POP_JUMP_IF_TRUE`**, **`OP_NOT`**. **Not** compiled yet (non-exhaustive): **trait** `impl`, some indirect calls beyond closures / named fns. **Array** / **tuple** literals use **`OP_ARRAY_NEW`** / **`OP_TUPLE_NEW`**; **`OP_ARRAY_LEN`** accepts both (**`VAL_ARRAY`** / **`VAL_TUPLE`**); **`OP_INDEX_INT`** loads from either sequence type. **`for v in …`** allows **arrays** or **homogeneous tuples** in the type checker (iterator value must be **`[T]`** or **`(T, T, …)`** with a single element type). **Struct update** (`Type { f: v, ..base, }`) **is** compiled: base is stored in a temp local, missing fields are copied with **`OP_GET_FIELD`** in declaration order, then **`OP_STRUCT_NEW`**.
+- **VM** (`vm.h` / `vm.c`): **stack** machine. Refcounting aligned with `eval.h` (`value_retain` / `value_release`). **`vm_run_program(chunks, nchunks, entry, args, nargs, structs, nstructs, symbol_pool, nsymbols)`** executes **`OP_CALL`** / **`OP_CALL_CLOSURE`** across multiple chunks and needs **`structs`/`symbol_pool`** when the program uses struct opcodes; **`vm_run_chunk`** passes **`NULL`/`0`** for those tables.
+- **Driver**: `./mons --vm-test` concatenates **`stdlib/core.mons`** + **`tests/vm_smoke.mons`**, typechecks, compiles, then runs **seventeen** bytecode entry checks (structs, spread, **`for`** over arrays and tuples, **`OP_INDEX_INT`** on **arrays and tuples**, **`OP_TUPLE_NEW`**, **float/double** smokes, …). Relative jumps (**`OP_JUMP`**, **`OP_POP_JUMP_IF_*`**) use **signed int16** displacements so loops can branch backward. **`smoke_block_expr`** uses a **nested block** initializer and **`if FLAG { … }`** with a **`pub const`** **`bool`** (**`FLAG`** is all-caps so the parser does not treat **`FLAG {`** as a struct literal). **`smoke_assign`** / **`smoke_assign_capture`** exercise **`=`**. Plain **`tests/smoke.mons`** is still typechecked alone in `make test`.
 
 Rationale: a stack VM is quicker to land than a register allocator; the opcode layout can be retargeted to registers later without changing the language semantics.
 
-#### Phase 2B — Calls, richer types, register machine *(partially in tree)*
+#### Phase 2B — Calls, richer types, register machine *(bytecode subset in tree)*
 
-- **Done:** **`compile_program_bc`**: every top-level `fn` in source order → `BcProgram` (`Chunk *chunks`, `nchunks`); **`bc_fn_index(program, name)`** for entry lookup. **`OP_CALL`** (callee chunk index + arity); callee must be a **named** function (`callee(args)` with `callee` an identifier). **`vm_run_program(chunks, nchunks, entry, args, nargs)`** with a **call stack** (saved `ip`, locals, chunk per frame). **`vm_run_chunk`** is `vm_run_program(chunk, 1, 0, …)`. `tests/smoke.mons` exercises a cross-function call (`smoke` → `bump`); **`--vm-test`** uses stdlib + `vm_smoke.mons` for a prelude + bytecode entry.
-- **Still open:** broader scalar/struct coverage on bytecode, optional **register-based** frame layout, **tri-color GC** where refcount is insufficient.
+- **Done:** **`compile_program_bc`**: every top-level **`fn`** and each **`impl`** method in **source order** → `BcProgram` (**`Chunk *chunks`**, **`BcStructLayout *structs`**, **`symbol_pool`** for **`OP_GET_FIELD_NAMED`**); **`bc_fn_index(program, name)`** includes **impl** methods. **`OP_CALL`** / **`OP_PUSH_FN`** / **`OP_CLOSURE`** / **`OP_CALL_CLOSURE`** as before. **`vm_run_program`** takes **struct layouts** and **symbol pool** for struct opcodes. **`tests/smoke.mons`** exercises a cross-function call (`smoke` → `bump`); **`--vm-test`** uses stdlib + **`vm_smoke.mons`**. **Scalars:** **`float`** / **`double`** literals, arithmetic, ordered compares, and **`OP_EQ`** / **`OP_NE`** on VM values. **`for`** over **homogeneous tuples** (type checker + interpreter + bytecode).
+- **Still open:** **trait** `impl`, optional **register-based** frame layout, **tri-color GC** where refcount is insufficient.
 
 #### Phase 2C — Reflection, stdlib prelude, tooling *(in tree)*
 
 - **Reflection** (`reflection.h` / `reflection.c`): **`reflection_fprint_program`** prints a line-oriented summary of **`pub struct`**, **`pub fn`** (params + return types from the AST), and **`pub const`** for downstream tooling. CLI: **`./mons --reflect file.mons`** (parse → typecheck → summary on stdout).
 - **Stdlib** (`stdlib/core.mons`): small **bytecode-safe** helpers (`twice`, `add`, …). **`--vm-test`** prepends this file to **`tests/vm_smoke.mons`** so the VM smoke exercises a **stdlib symbol** without a `use` system yet.
-- **Lambdas / closures (tree-walk):** Parser accepts `|params| body` and `|| body` (Rust-style empty params); parameters may omit types for inference. The type checker builds **`TY_FN`** with lexical capture via the environment chain. **`eval`** represents closures as **`VAL_CLOSURE`** (captured names + values at creation time; **`fv_`** walk finds free variables). **Calls** dispatch on **`VAL_CLOSURE`** or top-level **`NODE_FN_DECL`**. Nested lambdas and higher-order calls (`mk(5)(7)`) work. **Bytecode** still rejects **`NODE_LAMBDA`** (`compile.c`).
-- **Deferred:** **Tracing GC**, **`use` imports**, **lambdas in bytecode** (upvalue opcodes / `OP_CLOSURE`).
+- **Lambdas / closures (tree-walk):** Parser accepts `|params| body` and `|| body` (Rust-style empty params); parameters may omit types for inference. The type checker builds **`TY_FN`** with lexical capture via the environment chain. **`eval`** represents closures as **`VAL_CLOSURE`** (captured names + values at creation time; **`fv_`** walk finds free variables). **Calls** dispatch on **`VAL_CLOSURE`** or top-level **`NODE_FN_DECL`**. Nested lambdas and higher-order calls (`mk(5)(7)`) work.
+- **Lambdas / closures (bytecode):** **`compile_program_bc`** compiles **`NODE_LAMBDA`** when every parameter has an **explicit type**; body is a separate chunk with **`OP_GET_UPVALUE`** for captures. **`OP_CLOSURE`** records which enclosing locals/upvalues fill the closure cells. Interpreter-only closures use **`is_bytecode == false`** and **`lambda != NULL`**; VM closures use **`is_bytecode == true`**, **`lambda == NULL`**, and **`bc_chunk_idx`**. **`eval_invoke_closure`** refuses bytecode closures (VM-only).
+- **Deferred:** **Tracing GC**, **`use` imports**, **full** bytecode parity with interpreter lambdas (inferred param types, `||` without annotations, richer bodies).
 
 **Milestone (full Phase 2, long-term):** Mons programs run significantly faster than the tree-walk path; GC and closures support the full language + stdlib end-to-end.
+
+### Phase 2 completion checklist
+
+Ship the remainder of Phase 2 in **mergeable slices** (not one mega-change). **Owner (every row below):** you.
+
+| # | Workstream | Dependencies | Definition of done |
+|---|------------|--------------|-------------------|
+| 1 | **Bytecode closure parity** | None (may parallel minor VM fixes) | VM compiles and runs lambdas on par with the tree-walk path: inferred parameter types and empty-parameter lambdas (same surface as the parser’s Rust-style empty-params form); tests cover the bytecode path (extend `tests/closure.mons`, `tests/vm_smoke.mons`, or equivalent); README / this doc no longer claim inferred params or empty-param lambdas as VM-only gaps. |
+| 2 | **Bytecode `if` + `return` correctness** | 1 optional | `return` inside `if` / `else` branches matches interpreter semantics; `--vm-test` (or new test) covers nested branches and early return; block-as-value rules stay consistent with the type checker. |
+| 3 | **`match` (parser → types → eval + bytecode)** | 2 recommended | `match` parses and typechecks; exhaustiveness enforced as designed; interpreter and VM execute the same programs; dedicated `.mons` tests plus VM smoke entries; LANGUAGE / README list `match` as implemented on both paths. |
+| 4 | **`try` / `catch` / `finally`** | 3 optional (orthogonal) | If in Phase 2 scope: parse, typecheck, eval, and bytecode; `finally` runs on success, caught errors, and uncaught exits as specified; tests for success path, caught error, uncaught error, and interaction with `return`. If deferred, state explicitly here and in README as Phase 2+. |
+| 5 | **Trait `impl Trait for Type` + dispatch** | 3 recommended (stable calls) | Trait impls in the checker; dispatch agreed and documented (vtable vs monomorphization, default methods if any); interpreter and VM agree; tests for multiple traits / edge cases you care about; README no longer lists trait `impl` as open. |
+| 6 | **`use` / modules** | 5 recommended | `use` resolves across the compilation unit (or multi-file model you define); `--vm-test` can rely on `use` instead of source concatenation where appropriate; bad imports / cycles tested; grammar and LANGUAGE updated. |
+| 7 | **Tracing GC (or hybrid)** | Stable object graph: at minimum 1–3 | Cycles and long-lived heaps handled per chosen strategy; stress or leak-adjacent VM test; DESIGN “tracing GC deferred” language updated when landed. |
+| 8 | **Stdlib “real” prelude** | 6 strongly preferred | Core helpers promised by docs live under `stdlib/` and load via the real mechanism; `make test` / `--vm-test` depend on it; README tour examples either run or are explicitly future. |
+| 9 | **Phase 2 “closed” documentation** | 1–8 per scope | Single “Phase 2 complete” statement: in-scope features and explicit exclusions (e.g. AST macros, Phase 3); `make test` green; README milestone line matches this section. |
+
+**Dependency sketch** (compact):
+
+```
+1 closure VM parity
+2 if/return VM ──► 3 match
+3 match ──► 5 traits (recommended)
+5 traits ──► 6 use (recommended)
+1–3 stable ──► 7 GC
+6 use ──► 8 stdlib
+9 docs last
+4 try/catch ── may proceed in parallel unless tied to stack/unwind cleanup
+```
 
 ### Phase 3 — Native code (optional)
 
@@ -547,8 +578,8 @@ mons-lang/
 │   ├── eval.h              # Value, eval_call_by_name, value_retain, value_release
 │   ├── repl.h              # repl_run()
 │   ├── bytecode.h          # Chunk, opcodes (Phase 2A)
-│   ├── compile.h           # compile_program_bc, BcProgram (2A subset + 2B multi-chunk)
-│   ├── vm.h                # vm_run_program, vm_run_chunk (Phase 2A/2B)
+│   ├── compile.h           # compile_program_bc, BcProgram (chunks, layouts, symbol pool)
+│   ├── vm.h                # vm_run_program(chunks, …, structs, symbol_pool), vm_run_chunk
 │   └── reflection.h        # reflection_fprint_program (Phase 2C)
 │
 ├── stdlib/
@@ -571,8 +602,8 @@ mons-lang/
     ├── ast_print.c         # Debug AST printer
     └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test, --reflect)
 
-# Phase 2A–2C (in tree): bytecode, compile, vm, reflection; stdlib/core.mons prelude for VM smoke
-# Remainder: register VM tuning, tracing GC, lambdas/closures, use imports, macro.c, full stdlib
+# Phase 2A–2C (in tree): bytecode, compile, vm, reflection; stdlib/core.mons prelude for VM smoke; bytecode typed lambdas + upvalues; structs + inherent impl + field opcodes; floats/doubles + for-in over homogeneous tuples on bytecode
+# Remainder: trait impl, register VM tuning, tracing GC, full lambda parity on bytecode, use imports, macro.c, full stdlib, match/try on VM
 ```
 
 ---
