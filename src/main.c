@@ -150,10 +150,156 @@ static void usage(const char *argv0) {
             "usage: %s [-i|--repl|--vm-test|--reflect] [file.mons]\n"
             "  no args          run embedded demo (AST + typecheck + eval)\n"
             "  -i, --repl       interactive read-eval-print loop\n"
-            "  --vm-test        typecheck stdlib+vm_smoke, run smoke() on bytecode VM\n"
+            "  --vm-test        typecheck stdlib+vm_smoke, run bytecode VM smokes\n"
             "  --reflect FILE   print public API summary (after typecheck)\n"
             "  file.mons        lex, parse, and typecheck only\n",
             argv0);
+}
+
+static int vm_run_bc_entry(AstNode *program, CompileProgramResult *bc, const char *fn_name, VmResult *out_vr) {
+    int idx = bc_fn_index(program, fn_name);
+
+    if (idx < 0) {
+        fprintf(stderr, "compile error: no function \"%s\"\n", fn_name);
+        return 1;
+    }
+
+    *out_vr = vm_run_program(
+        bc->prog.chunks,
+        bc->prog.nchunks,
+        (size_t)idx,
+        NULL,
+        0,
+        bc->prog.structs,
+        bc->prog.nstructs,
+        (const char *const *)bc->prog.symbol_pool,
+        bc->prog.nsymbols);
+    if (!out_vr->ok) {
+        fprintf(stderr, "vm error (%s): %s\n",
+                fn_name,
+                out_vr->error_message ? out_vr->error_message : "unknown");
+        return 1;
+    }
+    return 0;
+}
+
+static float vm_absf(float x) {
+    return x < 0.0f ? -x : x;
+}
+
+static int vm_expect_int(VmResult *vr, const char *fn_name, int64_t expect_i) {
+    if (vr->result.kind != VAL_INT || vr->result.as.i != expect_i) {
+        fprintf(stderr, "vm smoke \"%s\": expected %lld, got ",
+                fn_name,
+                (long long)expect_i);
+        value_fprint(stderr, &vr->result);
+        fprintf(stderr, "\n");
+        value_release(&vr->result);
+        return 1;
+    }
+    printf("bytecode %s() = ", fn_name);
+    value_fprint(stdout, &vr->result);
+    printf("\n");
+    value_release(&vr->result);
+    return 0;
+}
+
+static int vm_expect_float(VmResult *vr, const char *fn_name, float expect_f) {
+    if (vr->result.kind != VAL_FLOAT) {
+        fprintf(stderr, "vm smoke \"%s\": expected float %f, got ", fn_name, (double)expect_f);
+        value_fprint(stderr, &vr->result);
+        fprintf(stderr, "\n");
+        value_release(&vr->result);
+        return 1;
+    }
+    if (vm_absf(vr->result.as.f - expect_f) > 1e-4f) {
+        fprintf(stderr, "vm smoke \"%s\": expected float ~%f, got %f\n",
+                fn_name, (double)expect_f, (double)vr->result.as.f);
+        value_release(&vr->result);
+        return 1;
+    }
+    printf("bytecode %s() = ", fn_name);
+    value_fprint(stdout, &vr->result);
+    printf("\n");
+    value_release(&vr->result);
+    return 0;
+}
+
+static int vm_expect_double(VmResult *vr, const char *fn_name, double expect_d) {
+    if (vr->result.kind != VAL_DOUBLE) {
+        fprintf(stderr, "vm smoke \"%s\": expected double %f, got ", fn_name, expect_d);
+        value_fprint(stderr, &vr->result);
+        fprintf(stderr, "\n");
+        value_release(&vr->result);
+        return 1;
+    }
+    {
+        double g = vr->result.as.d;
+        double d = g > expect_d ? g - expect_d : expect_d - g;
+        if (d > 1e-10) {
+            fprintf(stderr, "vm smoke \"%s\": expected double ~%f, got %f\n",
+                    fn_name, expect_d, g);
+            value_release(&vr->result);
+            return 1;
+        }
+    }
+    printf("bytecode %s() = ", fn_name);
+    value_fprint(stdout, &vr->result);
+    printf("\n");
+    value_release(&vr->result);
+    return 0;
+}
+
+static int vm_run_smoke_table(AstNode *program, CompileProgramResult *bc) {
+    static const struct {
+        const char *name;
+        char        kind; /* 'i' int, 'f' float, 'd' double */
+        int64_t     i;
+        float       f;
+        double      d;
+    } rows[] = {
+        {"smoke", 'i', 14, 0.0f, 0.0},
+        {"smoke_hof", 'i', 12, 0.0f, 0.0},
+        {"smoke_hof_capture", 'i', 17, 0.0f, 0.0},
+        {"smoke_nested", 'i', 13, 0.0f, 0.0},
+        {"smoke_ctrl", 'i', 29, 0.0f, 0.0},
+        {"smoke_assign", 'i', 5, 0.0f, 0.0},
+        {"smoke_assign_capture", 'i', 8, 0.0f, 0.0},
+        {"smoke_block_expr", 'i', 22, 0.0f, 0.0},
+        {"smoke_struct", 'i', 42, 0.0f, 0.0},
+        {"smoke_struct_field_named", 'i', 12, 0.0f, 0.0},
+        {"smoke_struct_spread", 'i', 14, 0.0f, 0.0},
+        {"smoke_for_sum", 'i', 10, 0.0f, 0.0},
+        {"smoke_array_index", 'i', 40, 0.0f, 0.0},
+        {"smoke_tuple_index", 'i', 25, 0.0f, 0.0},
+        {"smoke_float_sum", 'f', 0, 5.0f, 0.0},
+        {"smoke_double_half", 'd', 0, 0.0f, 5.0},
+        {"smoke_for_tuple_sum", 'i', 6, 0.0f, 0.0},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        VmResult vr;
+        if (vm_run_bc_entry(program, bc, rows[i].name, &vr) != 0) {
+            return 1;
+        }
+        if (rows[i].kind == 'i') {
+            if (vm_expect_int(&vr, rows[i].name, rows[i].i) != 0) {
+                return 1;
+            }
+        } else if (rows[i].kind == 'f') {
+            if (vm_expect_float(&vr, rows[i].name, rows[i].f) != 0) {
+                return 1;
+            }
+        } else if (rows[i].kind == 'd') {
+            if (vm_expect_double(&vr, rows[i].name, rows[i].d) != 0) {
+                return 1;
+            }
+        } else {
+            value_release(&vr.result);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int run_vm_smoke_test(void) {
@@ -165,8 +311,6 @@ static int run_vm_smoke_test(void) {
     ParseResult pr;
     TypeCheckResult tc;
     CompileProgramResult bc;
-    VmResult vr;
-    int smoke_idx;
 
     if (!src) {
         fprintf(stderr, "error: could not read \"%s\" and/or \"%s\"\n", prelude_path, user_path);
@@ -212,28 +356,13 @@ static int run_vm_smoke_test(void) {
         return 1;
     }
 
-    smoke_idx = bc_fn_index(pr.program, "smoke");
-    if (smoke_idx < 0) {
-        fprintf(stderr, "compile error: no function \"smoke\"\n");
+    if (vm_run_smoke_table(pr.program, &bc) != 0) {
         compile_program_result_free(&bc);
         token_array_free(&tokens);
         ast_free_all();
         return 1;
     }
 
-    vr = vm_run_program(bc.prog.chunks, bc.prog.nchunks, (size_t)smoke_idx, NULL, 0);
-    if (!vr.ok) {
-        fprintf(stderr, "vm error: %s\n", vr.error_message ? vr.error_message : "unknown");
-        compile_program_result_free(&bc);
-        token_array_free(&tokens);
-        ast_free_all();
-        return 1;
-    }
-
-    printf("bytecode smoke() = ");
-    value_fprint(stdout, &vr.result);
-    printf("\n");
-    value_release(&vr.result);
     compile_program_result_free(&bc);
     token_array_free(&tokens);
     ast_free_all();
