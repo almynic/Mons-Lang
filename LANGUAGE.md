@@ -149,7 +149,7 @@ Any expression followed by `;`.
 
 ### `for`
 
-Iterator form: **`for` *ident* `in` *expr* *block***. In Phase 1, runtime iteration is geared toward **arrays**.
+Iterator form: **`for` *ident* `in` *expr* *block***. *expr* may be an **array** or a **homogeneous tuple** (all elements must unify to one type); the loop variable has that element type.
 
 ```mons
 let a = [1, 2, 3];
@@ -239,6 +239,8 @@ let t = (10, 20);
 
 ### Struct literals and update
 
+The parser treats **`Ident {`** as a struct literal only when **`Ident`** looks like a **type name** (PascalCase: at least one lowercase letter after the first, or a single-letter uppercase name like **`T`**). **All-uppercase** identifiers (**`FLAG`**, **`MAX`**) are not struct literals, so **`if FLAG { … }`** is a boolean condition, not `FLAG { … }` fields.
+
 **Full init** (without base): every field must be supplied exactly once (type checker).
 
 ```mons
@@ -319,20 +321,21 @@ Rough checklist for this repository’s lexer, parser, type checker, and tree-wa
 
 - Top-level: **`struct`** (non-generic), **`fn`** / **`pub fn`**, **`const`** / **`pub const`** (annotated).
 - Types: primitives, arrays, tuples, named structs, `Option` / `Result` in type syntax (limited in expressions).
-- Statements: **`let`**, **`return`**, expression statements, **`for x in expr`** (arrays at runtime).
+- Statements: **`let`**, **`return`**, expression statements, **`for x in expr`** (array or homogeneous tuple).
 - Expressions: literals, **`if`**, blocks, operators above, assignment to locals, calls, **method calls** as desugared top-level `fn`, struct literals, **`..base`**, arrays/tuples and indexing.
-- Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; **`./mons --reflect FILE`** prints **`pub`** structs, functions, and constants from the type-checked AST; **`./mons --vm-test`** concatenates **`stdlib/core.mons`** with **`tests/vm_smoke.mons`** and runs **`smoke()`** on the bytecode VM (stdlib call **`twice(K)`**); no-arg driver runs the embedded eval demo.
-- **Lambdas:** `|x: T| expr`, `|| expr`, type inference on omitted param types; closures and calls (`f()` when `f` holds a closure) work in the **interpreter**, not in bytecode yet.
-- **Not** fully wired or rejected: `impl` / traits as runnable features, **`match`**, **`try` / `catch`**, macros expansion, `use`, and much of the full EBNF surface.
+- Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; **`./mons --reflect FILE`** prints **`pub`** structs, functions, and constants from the type-checked AST; **`./mons --vm-test`** concatenates **`stdlib/core.mons`** with **`tests/vm_smoke.mons`**, then runs a fixed set of bytecode smoke entries (closures, control flow, **`for`**, arrays + tuples + **`[]`**, **`float`/`double`**, structs + **`..base`**, inherent **`impl`**, …); no-arg driver runs the embedded eval demo.
+- **Lambdas:** `|x: T| expr`, `|| expr`, type inference on omitted param types; closures work in the **interpreter** for the full surface. **Bytecode** supports **typed** parameters only (`|x: int| …`) plus **`OP_CLOSURE`** / upvalues — no inferred param types or `||` on the VM yet.
+- **Inherent `impl`:** `impl StructName { fn f(self: StructName, …) { … } }` is parsed and type-checked; methods are compiled to bytecode and callable as **`recv.method(…)`** when included in **`--vm-test`** programs. **Trait** `impl Trait for Type` is not supported yet.
+- **Not** fully wired: **`match`**, **`try` / `catch`**, macro expansion, **`use`**, and much of the full EBNF surface beyond what the README lists.
 
 When in doubt, compare with [mons_grammar.ebnf](mons_grammar.ebnf) and the “implemented today” table in [README.md](README.md).
 
 ---
 
-## Planned / full grammar (not Phase 1)
+## Planned / full grammar (beyond what runs everywhere today)
 
 The EBNF also describes features intended for later stages, including:
 
-- `use` imports, `trait` / `impl`, `match`, closures `|x| ...`, `try` / `catch` / `finally`, generics on functions and structs, and `macro` definitions and `name!(...)` invocations.
+- `use` imports, **trait** `impl` / full trait objects, `match`, **`try` / `catch` / `finally`**, generics on functions and structs, and `macro` definitions and `name!(...)` invocations. **Inherent `impl`** and a **bytecode** subset are already implemented — see **README** / **DESIGN** Phase 2.
 
-Treat those as **design targets** unless the README explicitly lists them as implemented.
+Treat items as **design targets** unless the README explicitly lists them as implemented end-to-end on both interpreter and VM.
