@@ -1,6 +1,6 @@
 # Mons language reference
 
-This file describes **syntax** and gives **examples**. For design goals and implementation notes, see [README.md](README.md) and [DESIGN.md](DESIGN.md). The canonical formal grammar is [mons_grammar.ebnf](mons_grammar.ebnf). The **reference implementation** covers **Phase 1** (tree-walk `eval`) plus **Phase 2** stack bytecode for the [closed scope](DESIGN.md#phase-2-closed-scope-complete) in DESIGN (see [Implemented in Phase 1](#implemented-in-phase-1) below — that section lists what runs today on both paths where they differ).
+This file describes **syntax** and gives **examples**. For design goals and implementation notes, see [README.md](README.md) and [DESIGN.md](DESIGN.md). The canonical formal grammar is [mons_grammar.ebnf](mons_grammar.ebnf). The **reference implementation** covers **Phase 1** (tree-walk `eval`) plus **Phase 2** stack bytecode for the [closed scope](DESIGN.md#phase-2-closed-scope-complete) in DESIGN (see [Implemented Today](#implemented-today-phase-1--phase-2-closed-scope) below — that section lists what runs today on both paths where they differ).
 
 ## Table of contents
 
@@ -12,7 +12,7 @@ This file describes **syntax** and gives **examples**. For design goals and impl
 - [Statements](#statements)
 - [Expressions and precedence](#expressions-and-precedence)
 - [Worked mini-program](#worked-mini-program)
-- [Implemented in Phase 1](#implemented-in-phase-1)
+- [Implemented Today (Phase 1 + Phase 2 closed scope)](#implemented-today-phase-1--phase-2-closed-scope)
 - [Planned / full grammar](#planned--full-grammar-not-phase-1)
 
 ---
@@ -315,7 +315,7 @@ pub fn shifted() -> int {
 
 ---
 
-## Implemented in Phase 1
+## Implemented Today (Phase 1 + Phase 2 closed scope)
 
 Rough checklist for this repository’s lexer, parser, type checker, **tree-walk evaluator**, and **bytecode VM** (for the **Phase 2 closed** subset — not every EBNF form on both backends):
 
@@ -326,7 +326,7 @@ Rough checklist for this repository’s lexer, parser, type checker, **tree-walk
 - Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; **`./mons --reflect FILE`** prints **`pub`** structs, functions, and constants from the type-checked AST; **`./mons --vm-test`** resolves `use` imports starting from **`tests/vm_smoke.mons`** (which imports **`stdlib/core.mons`**), then runs a fixed set of bytecode smoke entries (closures, control flow, **`for`**, arrays + tuples + **`[]`**, **`float`/`double`**, structs + **`..base`**, trait + inherent **`impl`**, …); no-arg driver runs the embedded eval demo. **`make test`** includes **`tests/stdlib_core.mons`** so stdlib **`use`** is typechecked in plain file mode.
 - **Lambdas:** `|x: T| expr`, `|| expr`, type inference on omitted param types; closures work in the **interpreter** and on the **bytecode** VM (after typecheck, inferred parameter types are materialized on the AST for lowering). **`OP_CLOSURE`** / upvalues implement captures on the VM.
 - **Inherent + trait `impl`:** `impl StructName { ... }` and non-generic `impl TraitName for StructName { ... }` are parsed and type-checked; methods are compiled to bytecode and callable as **`recv.method(…)`** (resolved to one target function by static receiver type during typecheck).
-- **Not** fully wired: **`try` / `catch`** on bytecode, macro expansion, selective/glob `use` imports (`use foo::{a,b}` / `*`), every **`match`** pattern the EBNF allows (bytecode rejects some — README), and much of the full EBNF surface beyond what the README lists. Runtime composites use a hybrid memory strategy (refcount plus tracing sweep) so unreachable cycles can be reclaimed.
+- **Not** fully wired: **`try` / `catch` / `finally` / `throw`** on bytecode, macro expansion, selective/glob `use` imports (`use foo::{a,b}` / `*`), every **`match`** pattern the EBNF allows (bytecode rejects some — README), and much of the full EBNF surface beyond what the README lists. Runtime composites use a hybrid memory strategy (refcount plus tracing sweep) so unreachable cycles can be reclaimed.
 
 When in doubt, compare with [mons_grammar.ebnf](mons_grammar.ebnf) and the “implemented today” table in [README.md](README.md).
 

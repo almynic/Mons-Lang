@@ -24,7 +24,7 @@ Mons prefers expressions over statements, immutability over mutation, and compos
 - [Project structure](#project-structure)
 - [Building & CLI](#building--cli)
 - [Design principles](#design-principles)
-- [Language reference](LANGUAGE.md) (syntax & Phase 1 examples)
+- [Language reference](LANGUAGE.md) (syntax + implementation notes)
 
 ---
 
@@ -36,7 +36,7 @@ Mons prefers expressions over statements, immutability over mutation, and compos
 | Mutability | Immutable by default — explicit `mut` |
 | Paradigm | Functional-first, imperative possible |
 | OOP | Structs + traits + impl blocks — no class keyword |
-| Error handling | `Result[T, E]` + `match` or `try/catch/finally` |
+| Error handling | `Result[T, E]` + `match`; `try/catch/finally` on tree-walk today (VM support is Phase 2+) |
 | Metaprogramming | AST macros, runtime reflection, compile-time codegen |
 | Implementation | Written in C, zero dependencies |
 | Status | **Phase 1** tree-walk complete; **Phase 2 (closed scope)** complete — stack bytecode **2A–2C**, `use`, traits (MVP), hybrid GC, stdlib slice, **`--vm-test`** / **`--reflect`** ([DESIGN.md — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete)). **Phase 2+** / **Phase 3** prep: `try` on bytecode, macros, richer `use`, full stdlib, register VM, etc. |
@@ -154,7 +154,7 @@ Structs can implement multiple traits. Inheritance is supported but discouraged 
 
 ### Error handling
 
-Two styles coexist. `Result` + `match` is idiomatic; `try/catch/finally` exists for ergonomics and interop.
+Two styles coexist. `Result` + `match` is idiomatic; `try/catch/finally` exists for ergonomics and interop on the tree-walk path (bytecode support is still Phase 2+).
 
 ```mons
 // Result style
@@ -343,7 +343,7 @@ Built-in generic types:
 - **Struct literals** `Type { f: e, }`, **field access**, and **struct update** `Type { f: v, ..base, }` (spread must appear after explicit fields in the current parser).
 - **Arrays** and **tuples**: literals, indexing; tuple indices must be **integer literals** in the type checker.
 
-**Bytecode vs interpreter:** the tree-walk path still leads on **`try` / `catch`** and a few **`match`** pattern forms. **`match`** is lowered for **literals**, **`_`**, **binds**, **`Option::None`**, **`Option::Some` with a wildcard or bind inner pattern** (payload is a **single-element tuple** at runtime), and **struct patterns** with field binds; the bytecode compiler rejects **`|`** (or-patterns), **`Option::Some` with a literal inner pattern**, and nested tests inside **`Some`** for now. **Bytecode** otherwise covers **ints/bools**, **`float`/`double`**, **array** and **tuple** literals, **`for`** over arrays and **homogeneous** tuples, **`a[i]`** / **`t[i]`** (tuple index must be an **int literal** in the type checker), **structs** (literals, **`..base`**, field access), **inherent `impl`** and **trait** `impl Trait for Type` (static dispatch via **`resolved_fn`**), **lambdas** (including inferred parameter types and empty-parameter **`||`** form) + upvalues, **`use`**, **calls**, **`if`/`else`** (including **`return`** in a branch), **`&&`/`||`**, **`!`**, assignment, **`match`** as above, **hybrid refcount + tracing GC**, and **`stdlib/core.mons`** pulled in by **`tests/vm_smoke.mons`** for **`--vm-test`**. **AST macros** and fuller module features remain future — see **DESIGN**. **`--reflect`** lists **`pub`** API shapes from the AST.
+**Bytecode vs interpreter:** the tree-walk path still leads on **`try` / `catch`** and a few **`match`** pattern forms. **`match`** is lowered for **literals**, **`_`**, **binds**, **`Option::None`**, **`Option::Some` with a wildcard or bind inner pattern** (payload is a **single-element tuple** at runtime), and **struct patterns** with field binds; the bytecode compiler rejects **`|`** (or-patterns), **`Option::Some` with a literal inner pattern**, and nested tests inside **`Some`** for now. **Bytecode** otherwise covers **ints/bools**, **`float`/`double`**, **array** and **tuple** literals, **`for`** over arrays and **homogeneous** tuples, **`a[i]`** / **`t[i]`** (tuple index must be an **int literal** in the type checker), **structs** (literals, **`..base`**, field access), **inherent `impl`** and **trait** `impl Trait for Type` (static dispatch via **`resolved_fn`**), **lambdas** (including inferred parameter types and empty-parameter **`||`** form) + upvalues, **`use`**, **calls**, **`if`/`else`** (including branch `return`, but requiring an `else` on bytecode), **`&&`/`||`**, **`!`**, assignment, **`match`** as above, **hybrid refcount + tracing GC**, and **`stdlib/core.mons`** pulled in by **`tests/vm_smoke.mons`** for **`--vm-test`**. **AST macros** and fuller module features remain future — see **DESIGN**. **`--reflect`** lists **`pub`** API shapes from the AST.
 
 ---
 
