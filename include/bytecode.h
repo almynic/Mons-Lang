@@ -66,7 +66,11 @@ typedef enum {
     OP_GT_DOUBLE,
     OP_LTE_DOUBLE,
     OP_GTE_DOUBLE,
-    OP_SWAP /* swap two stack tops (deepest = sp-2, top = sp-1) */
+    OP_SWAP, /* swap two stack tops (deepest = sp-2, top = sp-1) */
+    OP_TRY_ENTER,  /* u16 handler target ip */
+    OP_TRY_EXIT,   /* pop one active try handler */
+    OP_THROW,      /* pop value and raise exception */
+    OP_EXN_IS_PRIM /* u8 PrimitiveType tag; pop value, push bool(kind matches) */
 } OpCode;
 
 /* Decl-order struct layouts for bytecode; `field_names` is owned (array of pointers into AST). */

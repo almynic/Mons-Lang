@@ -25,6 +25,8 @@ struct Ctx {
     uint8_t               next_slot;
     UpvalDesc             upvals[64];
     uint8_t               nupvals;
+    uint8_t               try_depth;
+    uint8_t               in_finally;
     const char           *error;
 };
 
@@ -484,6 +486,7 @@ static int resolve_upvalue(Ctx *c, const char *name) {
 
 static void compile_lambda(Ctx *parent, AstNode *lam);
 static void compile_for_stmt(Ctx *c, AstNode *st);
+static void compile_try_stmt(Ctx *c, AstNode *st);
 
 /* `trailing_return`: function body ends with OP_RETURN (value optional); otherwise tail expr is discarded. */
 static void compile_block_ex(Ctx *c, AstNode *blk, bool trailing_return) {
@@ -520,6 +523,10 @@ static void compile_block_ex(Ctx *c, AstNode *blk, bool trailing_return) {
                 break;
             }
             case NODE_RETURN:
+                if (c->try_depth > 0 || c->in_finally > 0) {
+                    compile_fail(c, "bytecode return inside try/catch/finally is not supported yet");
+                    return;
+                }
                 compile_expr(c, AS_RETURN(st).value);
                 if (c->error) {
                     return;
@@ -540,8 +547,17 @@ static void compile_block_ex(Ctx *c, AstNode *blk, bool trailing_return) {
                 }
                 break;
             case NODE_TRY:
+                compile_try_stmt(c, st);
+                if (c->error) {
+                    return;
+                }
+                break;
             case NODE_THROW:
-                compile_fail(c, "try/catch/finally and throw are not supported in bytecode yet");
+                compile_expr(c, AS_THROW(st).expr);
+                if (c->error) {
+                    return;
+                }
+                chunk_emit_u8(c->chunk, OP_THROW);
                 return;
             default:
                 compile_fail(c, "statement not supported in bytecode");
@@ -673,6 +689,175 @@ static void compile_for_stmt(Ctx *c, AstNode *st) {
     }
 }
 
+static int prim_type_to_u8(const AstNode *ty) {
+    if (!ty || ty->kind != NODE_TYPE_PRIMITIVE) {
+        return -1;
+    }
+    switch (AS_TYPE_PRIM(ty).prim) {
+        case PRIM_INT:
+            return (int)PRIM_INT;
+        case PRIM_FLOAT:
+            return (int)PRIM_FLOAT;
+        case PRIM_DOUBLE:
+            return (int)PRIM_DOUBLE;
+        case PRIM_BOOL:
+            return (int)PRIM_BOOL;
+        case PRIM_STRING:
+            return (int)PRIM_STRING;
+        default:
+            return -1;
+    }
+}
+
+static void compile_try_stmt(Ctx *c, AstNode *st) {
+    AstNode *body;
+    AstNode *fin;
+    AstList *cl;
+    size_t at_try_enter;
+    size_t at_jump_done;
+    size_t done_patches[32];
+    size_t ndone = 0;
+    uint8_t ex_slot;
+
+    if (!st || st->kind != NODE_TRY) {
+        compile_fail(c, "internal: try");
+        return;
+    }
+    body = AS_TRY(st).body;
+    fin = AS_TRY(st).finally_body;
+    if (!body || body->kind != NODE_BLOCK) {
+        compile_fail(c, "try body must be a block in bytecode");
+        return;
+    }
+
+    ex_slot = c->next_slot++;
+    if (c->next_slot > 255) {
+        compile_fail(c, "too many locals");
+        return;
+    }
+    if (c->chunk->nlocals < c->next_slot) {
+        c->chunk->nlocals = c->next_slot;
+    }
+    c->local_names[ex_slot] = NULL;
+
+    at_try_enter = c->chunk->len;
+    chunk_emit_u8(c->chunk, OP_TRY_ENTER);
+    chunk_emit_u16(c->chunk, 0);
+
+    c->try_depth++;
+    compile_block_ex(c, body, false);
+    c->try_depth--;
+    if (c->error) {
+        return;
+    }
+    chunk_emit_u8(c->chunk, OP_TRY_EXIT);
+
+    if (fin) {
+        c->in_finally++;
+        compile_block_ex(c, fin, false);
+        c->in_finally--;
+        if (c->error) {
+            return;
+        }
+    }
+
+    at_jump_done = c->chunk->len;
+    chunk_emit_u8(c->chunk, OP_JUMP);
+    chunk_emit_u16(c->chunk, 0);
+
+    chunk_patch_u16(c->chunk, at_try_enter + 1u, (uint16_t)(c->chunk->len - (at_try_enter + 3u)));
+
+    /* Exception handler entry: VM jumps here with thrown value on the stack. */
+    chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+    chunk_emit_u8(c->chunk, ex_slot);
+
+    for (cl = AS_TRY(st).catch_clauses; cl && !c->error; cl = cl->next) {
+        AstNode *cn = cl->item;
+        int ptag;
+        size_t at_next = 0;
+        uint8_t catch_slot;
+        if (!cn || cn->kind != NODE_CATCH_CLAUSE) {
+            continue;
+        }
+
+        ptag = prim_type_to_u8(AS_CATCH(cn).type);
+        if (ptag < 0) {
+            compile_fail(c, "bytecode catch type must be primitive");
+            return;
+        }
+
+        chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+        chunk_emit_u8(c->chunk, ex_slot);
+        chunk_emit_u8(c->chunk, OP_EXN_IS_PRIM);
+        chunk_emit_u8(c->chunk, (uint8_t)ptag);
+        at_next = c->chunk->len;
+        chunk_emit_u8(c->chunk, OP_POP_JUMP_IF_FALSE);
+        chunk_emit_u16(c->chunk, 0);
+
+        catch_slot = c->next_slot++;
+        if (c->next_slot > 255) {
+            compile_fail(c, "too many locals");
+            return;
+        }
+        if (c->chunk->nlocals < c->next_slot) {
+            c->chunk->nlocals = c->next_slot;
+        }
+        c->local_names[catch_slot] = AS_CATCH(cn).var;
+        chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+        chunk_emit_u8(c->chunk, ex_slot);
+        chunk_emit_u8(c->chunk, OP_STORE_LOCAL);
+        chunk_emit_u8(c->chunk, catch_slot);
+
+        c->try_depth++;
+        compile_block_ex(c, AS_CATCH(cn).body, false);
+        c->try_depth--;
+        if (c->error) {
+            return;
+        }
+
+        if (fin) {
+            c->in_finally++;
+            compile_block_ex(c, fin, false);
+            c->in_finally--;
+            if (c->error) {
+                return;
+            }
+        }
+
+        if (ndone >= sizeof(done_patches) / sizeof(done_patches[0])) {
+            compile_fail(c, "too many catch clauses");
+            return;
+        }
+        done_patches[ndone++] = c->chunk->len;
+        chunk_emit_u8(c->chunk, OP_JUMP);
+        chunk_emit_u16(c->chunk, 0);
+
+        chunk_patch_u16(c->chunk, at_next + 1u, (uint16_t)(c->chunk->len - (at_next + 3u)));
+    }
+
+    /* No catch matched: run finally then rethrow. */
+    if (fin) {
+        c->in_finally++;
+        compile_block_ex(c, fin, false);
+        c->in_finally--;
+        if (c->error) {
+            return;
+        }
+    }
+    chunk_emit_u8(c->chunk, OP_LOAD_LOCAL);
+    chunk_emit_u8(c->chunk, ex_slot);
+    chunk_emit_u8(c->chunk, OP_THROW);
+
+    chunk_patch_u16(c->chunk, at_jump_done + 1u, (uint16_t)(c->chunk->len - (at_jump_done + 3u)));
+    {
+        size_t i;
+        for (i = 0; i < ndone; i++) {
+            size_t at = done_patches[i];
+            chunk_patch_u16(c->chunk, at + 1u, (uint16_t)(c->chunk->len - (at + 3u)));
+        }
+    }
+}
+
 /* Block as a value (e.g. `if` branch): tail expression and/or `return` (early exit from the whole fn chunk). */
 static void compile_block_as_value(Ctx *c, AstNode *blk) {
     AstList *sl;
@@ -708,6 +893,10 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
                 break;
             }
             case NODE_RETURN:
+                if (c->try_depth > 0 || c->in_finally > 0) {
+                    compile_fail(c, "bytecode return inside try/catch/finally is not supported yet");
+                    return;
+                }
                 if (!AS_RETURN(st).value) {
                     compile_fail(c, "bare return in branch block not supported in bytecode yet");
                     return;
@@ -732,8 +921,17 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
                 }
                 break;
             case NODE_TRY:
+                compile_try_stmt(c, st);
+                if (c->error) {
+                    return;
+                }
+                break;
             case NODE_THROW:
-                compile_fail(c, "try/catch/finally and throw are not supported in bytecode yet");
+                compile_expr(c, AS_THROW(st).expr);
+                if (c->error) {
+                    return;
+                }
+                chunk_emit_u8(c->chunk, OP_THROW);
                 return;
             default:
                 compile_fail(c, "statement not supported in bytecode");

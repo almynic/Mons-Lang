@@ -520,7 +520,7 @@ Rationale: a stack VM is quicker to land than a register allocator; the opcode l
 - **Done:** hybrid memory management for runtime composites: refcount fast-path + tracing sweep to reclaim unreachable cycles.
 - **Deferred:** richer module features (`use foo::{...}`, glob imports, package boundaries), and any remaining **lambda body** gaps on bytecode versus the interpreter (only if new surface appears).
 
-**Milestone (Phase 2 in this repo):** the staged **2A–2C** bytecode path, **`use`**, trait dispatch, hybrid GC, a **stdlib** slice, and **`--vm-test`** are complete for the [closed scope](#phase-2-closed-scope-complete) below. **Long-term:** register VM tuning, **`try` on bytecode**, and a full standard library remain **Phase 2+** / **Phase 3** prep.
+**Milestone (Phase 2 in this repo):** the staged **2A–2C** bytecode path, **`use`**, trait dispatch, hybrid GC, bytecode **`try/catch/finally/throw`** (with documented limits), a **stdlib** slice, and **`--vm-test`** are complete for the [closed scope](#phase-2-closed-scope-complete) below. **Long-term:** register VM tuning and a full standard library remain **Phase 2+** / **Phase 3** prep.
 
 ### Phase 2 completion checklist
 
@@ -531,7 +531,7 @@ Delivered in **mergeable slices**. **Normative “Phase 2 complete”** for this
 | 1 | **Bytecode closure parity** | None (may parallel minor VM fixes) | **Done** — VM lowers inferred params and empty-parameter lambdas; checker materializes param / return type nodes on the AST; `smoke_infer_unary`, `smoke_infer_pair`, `smoke_pipe_closure` in `--vm-test` plus extra cases in `tests/closure.mons`; README / LANGUAGE / this doc updated. |
 | 2 | **Bytecode `if` + `return` correctness** | 1 optional | **Done** — `compile_block_as_value` emits **`OP_RETURN`** for branch `return`; **`infer_block`** types `if` branches that mix `return` and tail values; `smoke_if_return_*` in `--vm-test`; `if_return_ok` in `tests/closure.mons`. |
 | 3 | **`match` (parser → types → eval + bytecode)** | 2 recommended | **Done** — `match` parses (including `Option::None` as `TOK_NONE` after `::`); exhaustiveness for bool / `Option` / scalars / struct (`_` required); tree-walk + bytecode for literals, `_`, binds, `Option::None` / `Option::Some` (1-tuple runtime), struct fields; `|` without bindings; bytecode skips `|` patterns, `Option::Some` inner literals, and defers some enum/struct edges — see README; `smoke_match_*` in `--vm-test`; `tests/closure.mons` match cases; README / LANGUAGE updated. |
-| 4 | **`try` / `catch` / `finally`** | 3 optional (orthogonal) | **Interpreter:** parse, typecheck, tree-walk **`eval`** (`NODE_TRY`, `throw`, `finally`). **Bytecode:** **Phase 2+** — `compile_program_bc` rejects `try`/`catch`/`finally`/`throw` (README “Bytecode vs interpreter”). |
+| 4 | **`try` / `catch` / `finally`** | 3 optional (orthogonal) | **Done (MVP on both backends)** — parse, typecheck, tree-walk eval, and bytecode VM support `try/catch/finally/throw`; `finally` runs on success and throw paths; VM smoke covers basic/cross-call throw + finally. **Known VM gap:** `return` inside `try`/`catch`/`finally` regions is not lowered yet (compile-time rejection). |
 | 5 | **Trait `impl Trait for Type` + dispatch** | 3 recommended (stable calls) | **Done (MVP)** — parse `trait { fn …; }`, `impl Trait for Type { … }`; checker registers traits, checks impl signatures vs trait (structural AST match on params/returns), rejects generics/supertraits; **no vtable**: `r.m()` resolves by **static receiver type** to a single `NODE_FN_DECL` stored as **`method_call.resolved_fn`** (same index model as inherent `impl`); interpreter + bytecode use it; `tests/trait_impl.mons` + `smoke_trait_bump` in `--vm-test`; default trait methods / `Self` / trait objects remain Phase 2+. |
 | 6 | **`use` / modules** | 5 recommended | **Done (MVP)** — top-level `use module::path;` parses into `NODE_USE_DECL`; loader resolves imports recursively before lex/parse, de-duplicates modules, and detects cycles; unresolved imports and cycles are tested (`tests/use_missing.mons`, `tests/use_cycle_a.mons`); `--vm-test` relies on `use stdlib::core;` from `tests/vm_smoke.mons`; selective/glob `use` remains future. |
 | 7 | **Tracing GC (or hybrid)** | Stable object graph: at minimum 1–3 | **Done (hybrid)** — runtime keeps refcount semantics and tracks heap composites globally; `value_gc_collect(...)` marks from roots and sweeps unreachable objects (including cycles). VM and interpreter invoke sweep at call boundaries preserving returned roots. `run_gc_stress_test()` in `--vm-test` builds synthetic cycles and verifies live-object count returns to baseline. |
@@ -551,7 +551,7 @@ The **Phase 2** milestone in this repository means: **Phase 1** tree-walk (`eval
 
 **Explicitly out of scope for this “Phase 2 complete” label (Phase 2+ or later):**
 
-- **`try` / `catch` / `finally` / `throw` on bytecode** (tree-walk has them; VM does not compile them yet).
+- **Full parity for `try` with `return`-interaction on bytecode** (current VM lowers try/catch/finally/throw but rejects `return` inside those regions).
 - **AST macro expansion** before typecheck (`macro.c` pipeline).
 - **Selective / glob `use`**, package layout, richer module system.
 - **Generics**, **trait objects**, default trait methods, **`Self`** in traits (non-generic trait **`impl`** only).
@@ -626,8 +626,8 @@ mons-lang/
     ├── ast_print.c         # Debug AST printer
     └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test, --reflect)
 
-# Phase 2 (closed scope): bytecode 2A–2C, reflection, stdlib/core.mons via use, hybrid GC, trait impl + match subset + try on interpreter only — see “Phase 2 closed scope (complete)” above
-# Phase 2+: try/catch on VM, macro pass, richer use, full stdlib, register VM, remaining match/forms
+# Phase 2 (closed scope): bytecode 2A–2C, reflection, stdlib/core.mons via use, hybrid GC, trait impl + match subset + try/catch/finally/throw on both backends (VM gap: return inside try regions) — see “Phase 2 closed scope (complete)” above
+# Phase 2+: full try/return parity on VM, macro pass, richer use, full stdlib, register VM, remaining match/forms
 ```
 
 ---

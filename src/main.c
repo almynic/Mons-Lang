@@ -630,6 +630,10 @@ static int vm_run_smoke_table(AstNode *program, CompileProgramResult *bc) {
         {"smoke_match_int", 'i', 13, 0.0f, 0.0},
         {"smoke_match_option_none", 'i', 2, 0.0f, 0.0},
         {"smoke_trait_bump", 'i', 5, 0.0f, 0.0},
+        {"smoke_try_catch_basic", 'i', 9, 0.0f, 0.0},
+        {"smoke_try_catch_cross_call", 'i', 12, 0.0f, 0.0},
+        {"smoke_try_finally", 'i', 7, 0.0f, 0.0},
+        {"smoke_try_catch_finally", 'i', 16, 0.0f, 0.0},
     };
     size_t i;
     for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {

@@ -215,3 +215,57 @@ pub fn smoke_trait_bump() -> int {
     let c = VmBumpCounter { n: 4, };
     c.vm_bump()
 }
+
+
+fn vm_throw_int() -> int {
+    try {
+        throw 11;
+    } catch (e: int) {
+        throw e;
+    };
+    0
+}
+
+pub fn smoke_try_catch_basic() -> int {
+    let mut out = 0;
+    try {
+        throw 9;
+    } catch (e: int) {
+        out = e;
+    };
+    out
+}
+
+pub fn smoke_try_catch_cross_call() -> int {
+    let mut out = 1;
+    try {
+        vm_throw_int();
+    } catch (e: int) {
+        out = e + 1;
+    };
+    out
+}
+
+pub fn smoke_try_finally() -> int {
+    let mut x = 2;
+    try {
+        x = 4;
+    } catch (e: int) {
+        x = e;
+    } finally {
+        x = x + 3;
+    };
+    x
+}
+
+pub fn smoke_try_catch_finally() -> int {
+    let mut x = 1;
+    try {
+        throw 7;
+    } catch (e: int) {
+        x = e + 1;
+    } finally {
+        x = x * 2;
+    };
+    x
+}

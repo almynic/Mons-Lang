@@ -1,5 +1,6 @@
 #include "vm.h"
 
+#include "ast.h"
 #include "eval.h"
 
 #include <stdint.h>
@@ -8,6 +9,7 @@
 
 #define VM_STACK_CAP 512u
 #define VM_MAX_DEPTH 256u
+#define VM_TRY_CAP 256u
 
 static void vm_fail(VmResult *out, const char *msg) {
     out->ok = false;
@@ -59,6 +61,12 @@ typedef struct {
     size_t       nupvalues;
     ValClosure  *closure_held; /* retained while frame is active */
 } VmFrame;
+
+typedef struct {
+    int    frame_depth;
+    size_t handler_ip;
+    size_t stack_sp;
+} VmTryHandler;
 
 static void stack_push(Value *stack, size_t *sp, size_t cap, Value v, VmResult *out, int *err) {
     if (*sp >= cap) {
@@ -113,11 +121,13 @@ VmResult vm_run_program(
     size_t nsymbols) {
     VmResult out;
     VmFrame fr[VM_MAX_DEPTH];
+    VmTryHandler try_stack[VM_TRY_CAP];
     Value stack[VM_STACK_CAP];
 
     memset(fr, 0, sizeof(fr));
     size_t sp = 0;
     int depth = 0;
+    size_t ntry = 0;
     int err = 0;
     const Chunk *chunk;
     size_t ip;
@@ -1153,6 +1163,106 @@ double_op_done:
                     stack[sp - 1u] = t;
                     break;
                 }
+                case OP_TRY_ENTER: {
+                    uint16_t raw = (uint16_t)chunk->code[ip] | ((uint16_t)chunk->code[ip + 1u] << 8);
+                    int16_t soff = (int16_t)raw;
+                    int64_t hip;
+                    ip += 2u;
+                    hip = (int64_t)ip + (int64_t)soff;
+                    if (hip < 0 || (size_t)hip > chunk->len) {
+                        vm_fail(&out, "vm: try handler jump out of range");
+                        err = 1;
+                        break;
+                    }
+                    if (ntry >= VM_TRY_CAP) {
+                        vm_fail(&out, "vm: try stack overflow");
+                        err = 1;
+                        break;
+                    }
+                    try_stack[ntry].frame_depth = depth;
+                    try_stack[ntry].handler_ip = (size_t)hip;
+                    try_stack[ntry].stack_sp = sp;
+                    ntry++;
+                    break;
+                }
+                case OP_TRY_EXIT:
+                    if (ntry == 0) {
+                        vm_fail(&out, "vm: try stack underflow");
+                        err = 1;
+                        break;
+                    }
+                    ntry--;
+                    break;
+                case OP_THROW: {
+                    Value ex = stack_pop(stack, &sp, &out, &err);
+                    if (err) {
+                        break;
+                    }
+                    if (ntry == 0) {
+                        value_release(&ex);
+                        vm_fail(&out, "uncaught exception");
+                        err = 1;
+                        break;
+                    }
+                    {
+                        VmTryHandler h = try_stack[ntry - 1u];
+                        ntry--;
+                        while (depth > h.frame_depth) {
+                            free_frame_locals(&fr[depth]);
+                            depth--;
+                        }
+                        while (sp > h.stack_sp) {
+                            Value drop = stack[--sp];
+                            value_release(&drop);
+                        }
+                        fr[depth].ip = h.handler_ip;
+                        stack_push(stack, &sp, VM_STACK_CAP, ex, &out, &err);
+                        if (err) {
+                            value_release(&ex);
+                            break;
+                        }
+                    }
+                    goto reload;
+                }
+                case OP_EXN_IS_PRIM: {
+                    uint8_t tag = chunk->code[ip++];
+                    Value ex = stack_pop(stack, &sp, &out, &err);
+                    Value b;
+                    bool ok = false;
+                    if (err) {
+                        break;
+                    }
+                    switch (tag) {
+                        case PRIM_INT:
+                            ok = ex.kind == VAL_INT;
+                            break;
+                        case PRIM_FLOAT:
+                            ok = ex.kind == VAL_FLOAT;
+                            break;
+                        case PRIM_DOUBLE:
+                            ok = ex.kind == VAL_DOUBLE;
+                            break;
+                        case PRIM_BOOL:
+                            ok = ex.kind == VAL_BOOL;
+                            break;
+                        case PRIM_STRING:
+                            ok = ex.kind == VAL_STRING;
+                            break;
+                        default:
+                            value_release(&ex);
+                            vm_fail(&out, "vm: unknown primitive tag in OP_EXN_IS_PRIM");
+                            err = 1;
+                            break;
+                    }
+                    if (err) {
+                        break;
+                    }
+                    value_release(&ex);
+                    b.kind = VAL_BOOL;
+                    b.as.b = ok;
+                    stack_push(stack, &sp, VM_STACK_CAP, b, &out, &err);
+                    break;
+                }
                 case OP_CALL_CLOSURE: {
                     uint8_t na = chunk->code[ip++];
                     Value *argv;
@@ -1271,12 +1381,16 @@ double_op_done:
                 }
                 case OP_RETURN: {
                     Value v = stack_pop(stack, &sp, &out, &err);
+                    int old_depth = depth;
                     if (err) {
                         break;
                     }
 
                     free_frame_locals(&fr[depth]);
                     depth--;
+                    while (ntry > 0 && try_stack[ntry - 1u].frame_depth >= old_depth) {
+                        ntry--;
+                    }
                     if (depth < 0) {
                         out.result = v;
                         out.ok = true;
