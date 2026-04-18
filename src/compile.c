@@ -802,10 +802,6 @@ static void compile_lambda(Ctx *parent, AstNode *lam) {
     }
     for (pl = AS_LAMBDA(lam).params, i = 0; pl; pl = pl->next, i++) {
         AstNode *pm = pl->item;
-        if (AS_PARAM(pm).type == NULL) {
-            compile_fail(parent, "bytecode lambdas need explicit parameter types");
-            return;
-        }
         child.local_names[i] = AS_PARAM(pm).name;
     }
     child.next_slot = (uint8_t)nparams;

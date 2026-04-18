@@ -29,6 +29,23 @@ pub fn smoke_hof_capture() -> int {
     f(10)
 }
 
+/* Inferred lambda params + empty-param closure (bytecode parity with interpreter). */
+pub fn smoke_infer_unary() -> int {
+    let f = |n| n + 1;
+    f(41)
+}
+
+pub fn smoke_infer_pair() -> int {
+    let add = |a, b| a + 0 + b;
+    add(40, 2)
+}
+
+pub fn smoke_pipe_closure() -> int {
+    let x = 12;
+    let d = || x;
+    d()
+}
+
 pub fn smoke_nested() -> int {
     let outer = |a: int| {
         let inner = |b: int| a + b;

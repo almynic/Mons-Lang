@@ -14,6 +14,16 @@ pub fn nested_lambda_ok() -> int {
     outer(10)
 }
 
+pub fn infer_lambda_ok() -> int {
+    let f = |n| n + 1;
+    f(9)
+}
+
+pub fn infer_two_params_ok() -> int {
+    let add = |a, b| a + 0 + b;
+    add(3, 4)
+}
+
 pub fn ctrl_flow_ok() -> int {
     if true && !false { 1 } else { 0 }
 }

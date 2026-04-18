@@ -527,6 +527,192 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
     }
 }
 
+/* Materialize an inferred Type* as AST type syntax (arena). Used so bytecode / tools see param types. */
+static AstNode *type_to_ast_type(Checker *c, Type *t, SrcLoc loc) {
+    Type *p = prune(t);
+    if (!p) {
+        checker_fail(c, loc, "internal: null type");
+        return NULL;
+    }
+    switch (p->kind) {
+        case TY_INT: {
+            AstNode *n = ast_alloc(NODE_TYPE_PRIMITIVE, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_PRIM(n).prim = PRIM_INT;
+            return n;
+        }
+        case TY_FLOAT: {
+            AstNode *n = ast_alloc(NODE_TYPE_PRIMITIVE, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_PRIM(n).prim = PRIM_FLOAT;
+            return n;
+        }
+        case TY_DOUBLE: {
+            AstNode *n = ast_alloc(NODE_TYPE_PRIMITIVE, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_PRIM(n).prim = PRIM_DOUBLE;
+            return n;
+        }
+        case TY_BOOL: {
+            AstNode *n = ast_alloc(NODE_TYPE_PRIMITIVE, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_PRIM(n).prim = PRIM_BOOL;
+            return n;
+        }
+        case TY_STRING: {
+            AstNode *n = ast_alloc(NODE_TYPE_PRIMITIVE, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_PRIM(n).prim = PRIM_STRING;
+            return n;
+        }
+        case TY_VOID:
+            checker_fail(c, loc, "internal: void in type materialization");
+            return NULL;
+        case TY_VAR:
+            checker_fail(c, loc, "could not fully infer type (add annotations)");
+            return NULL;
+        case TY_STRUCT: {
+            AstNode *n = ast_alloc(NODE_TYPE_NAMED, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_NAMED(n).name = p->as.st_def.name;
+            AS_TYPE_NAMED(n).type_args = NULL;
+            return n;
+        }
+        case TY_ARRAY: {
+            AstNode *el = type_to_ast_type(c, p->as.inner, loc);
+            if (c->error || !el) {
+                return NULL;
+            }
+            {
+                AstNode *n = ast_alloc(NODE_TYPE_ARRAY, loc);
+                if (!n) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+                AS_TYPE_ARRAY(n).elem_type = el;
+                return n;
+            }
+        }
+        case TY_OPTION: {
+            AstNode *in = type_to_ast_type(c, p->as.inner, loc);
+            if (c->error || !in) {
+                return NULL;
+            }
+            {
+                AstNode *n = ast_alloc(NODE_TYPE_OPTION, loc);
+                if (!n) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+                AS_TYPE_OPTION(n).inner = in;
+                return n;
+            }
+        }
+        case TY_RESULT: {
+            AstNode *ok = type_to_ast_type(c, p->as.result.ok, loc);
+            if (c->error || !ok) {
+                return NULL;
+            }
+            {
+                AstNode *err = type_to_ast_type(c, p->as.result.err, loc);
+                AstNode *n;
+                if (c->error || !err) {
+                    return NULL;
+                }
+                n = ast_alloc(NODE_TYPE_RESULT, loc);
+                if (!n) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+                AS_TYPE_RESULT(n).ok_type = ok;
+                AS_TYPE_RESULT(n).err_type = err;
+                return n;
+            }
+        }
+        case TY_TUPLE: {
+            AstList *lst = NULL;
+            size_t j;
+            for (j = 0; j < p->as.tuple.nelems; j++) {
+                AstNode *el = type_to_ast_type(c, p->as.tuple.elems[j], loc);
+                if (c->error || !el) {
+                    return NULL;
+                }
+                lst = ast_list_append(lst, el);
+                if (!lst) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+            }
+            {
+                AstNode *n = ast_alloc(NODE_TYPE_TUPLE, loc);
+                if (!n) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+                AS_TYPE_TUPLE(n).elem_types = lst;
+                return n;
+            }
+        }
+        case TY_FN: {
+            AstList *ptypes = NULL;
+            size_t j;
+            AstNode *rt;
+            AstNode *n;
+            for (j = 0; j < p->as.fn.nparams; j++) {
+                AstNode *pt = type_to_ast_type(c, p->as.fn.params[j], loc);
+                if (c->error || !pt) {
+                    return NULL;
+                }
+                ptypes = ast_list_append(ptypes, pt);
+                if (!ptypes) {
+                    checker_fail(c, loc, "out of memory");
+                    return NULL;
+                }
+            }
+            {
+                Type *rpr = prune(p->as.fn.ret);
+                if (rpr->kind == TY_VOID) {
+                    checker_fail(c, loc, "cannot materialize function type with void return");
+                    return NULL;
+                }
+                rt = type_to_ast_type(c, rpr, loc);
+            }
+            if (c->error || !rt) {
+                return NULL;
+            }
+            n = ast_alloc(NODE_TYPE_FN, loc);
+            if (!n) {
+                checker_fail(c, loc, "out of memory");
+                return NULL;
+            }
+            AS_TYPE_FN(n).param_types = ptypes;
+            AS_TYPE_FN(n).ret_type = rt;
+            return n;
+        }
+        default:
+            checker_fail(c, loc, "internal: unsupported type for materialization");
+            return NULL;
+    }
+}
+
 static Type *infer_expr_impl(Checker *c, AstNode *n);
 static Type *infer_expr(Checker *c, AstNode *n);
 
@@ -1092,6 +1278,31 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
                     env_free_head(&lam_env);
                     free(pts);
                     return NULL;
+                }
+
+                for (pl = AS_LAMBDA(lam).params, i = 0; pl; pl = pl->next, i++) {
+                    AstNode *param = pl->item;
+                    if (AS_PARAM(param).type == NULL) {
+                        AstNode *ann = type_to_ast_type(c, pts[i], param->loc);
+                        if (c->error || !ann) {
+                            env_free_head(&lam_env);
+                            free(pts);
+                            return NULL;
+                        }
+                        AS_PARAM(param).type = ann;
+                    }
+                }
+                if (!AS_LAMBDA(lam).ret_type) {
+                    Type *prt = prune(ret_goal);
+                    if (prt && prt->kind != TY_VOID) {
+                        AstNode *rt = type_to_ast_type(c, prt, lam->loc);
+                        if (c->error || !rt) {
+                            env_free_head(&lam_env);
+                            free(pts);
+                            return NULL;
+                        }
+                        AS_LAMBDA(lam).ret_type = rt;
+                    }
                 }
 
                 env_free_head(&lam_env);
