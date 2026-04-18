@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 
 static const char *embedded_sample =
     "struct Point {\n"
@@ -299,47 +300,268 @@ static int append_text(char **dst, size_t *len, const char *src) {
     return 1;
 }
 
-static int parse_use_module_from_line(const char *line, char *module_out, size_t cap) {
-    const char *p = line;
-    size_t n = 0;
+static int is_ident_start_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int is_ident_char(char c) {
+    return is_ident_start_char(c) || (c >= '0' && c <= '9');
+}
+
+static void skip_ws(const char **pp) {
+    const char *p = *pp;
     while (*p == ' ' || *p == '\t') {
         p++;
     }
-    if (strncmp(p, "use ", 4) != 0) {
+    *pp = p;
+}
+
+static int append_module_item(StrVec *v, const char *s, size_t n) {
+    char tmp[256];
+    if (n == 0 || n >= sizeof(tmp)) {
         return 0;
     }
-    p += 4;
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
-    if (*p == '\0') {
+    memcpy(tmp, s, n);
+    tmp[n] = '\0';
+    return strvec_push_copy(v, tmp);
+}
+
+/* Returns: 0=not use line, 1=parsed use, -1=invalid/unsupported syntax. */
+static int parse_use_decl_from_line(const char *line, char *base_out, size_t cap, StrVec *items_out, int *glob_out) {
+    const char *p = line;
+    size_t bn = 0;
+    int saw_part = 0;
+
+    if (!base_out || cap == 0 || !items_out || !glob_out) {
         return -1;
     }
-    while (*p && *p != ';' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
-        if ((*p >= 'a' && *p <= 'z') ||
-            (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') ||
-            *p == '_' || *p == ':') {
-            if (n + 1u >= cap) {
+    *glob_out = 0;
+    base_out[0] = '\0';
+    skip_ws(&p);
+    if (strncmp(p, "use", 3) != 0 || !(*((p + 3)) == ' ' || *((p + 3)) == '\t')) {
+        return 0;
+    }
+    p += 3;
+    skip_ws(&p);
+
+    while (1) {
+        const char *s = p;
+        size_t n = 0;
+        if (!is_ident_start_char(*p)) {
+            return -1;
+        }
+        while (is_ident_char(*p)) {
+            p++;
+            n++;
+        }
+        if (bn != 0) {
+            if (bn + 2u >= cap) {
                 return -1;
             }
-            module_out[n++] = *p;
-            p++;
+            base_out[bn++] = ':';
+            base_out[bn++] = ':';
+        }
+        if (bn + n + 1u >= cap) {
+            return -1;
+        }
+        memcpy(base_out + bn, s, n);
+        bn += n;
+        base_out[bn] = '\0';
+        saw_part = 1;
+        if (p[0] == ':' && p[1] == ':') {
+            p += 2;
+            if (*p == '*') {
+                p++;
+                *glob_out = 1;
+                break;
+            }
+            if (*p == '{') {
+                p++;
+                skip_ws(&p);
+                if (*p == '*') {
+                    p++;
+                    skip_ws(&p);
+                    if (*p != '}') {
+                        return -1;
+                    }
+                    p++;
+                    *glob_out = 1;
+                    break;
+                }
+                while (1) {
+                    const char *is = p;
+                    size_t in = 0;
+                    if (!is_ident_start_char(*p)) {
+                        return -1;
+                    }
+                    while (is_ident_char(*p)) {
+                        p++;
+                        in++;
+                    }
+                    if (!append_module_item(items_out, is, in)) {
+                        return -1;
+                    }
+                    skip_ws(&p);
+                    if (*p == ',') {
+                        p++;
+                        skip_ws(&p);
+                        continue;
+                    }
+                    if (*p == '}') {
+                        p++;
+                        break;
+                    }
+                    return -1;
+                }
+                break;
+            }
             continue;
         }
+        break;
+    }
+
+    if (!saw_part) {
         return -1;
     }
-    module_out[n] = '\0';
-    if (n == 0) {
-        return -1;
-    }
-    while (*p == ' ' || *p == '\t') {
-        p++;
-    }
+    skip_ws(&p);
     if (*p != ';') {
         return -1;
     }
+    p++;
+    skip_ws(&p);
+    if (*p != '\0' && *p != '\r' && *p != '\n') {
+        return -1;
+    }
+    if (*glob_out && items_out->len > 0) {
+        return -1;
+    }
     return 1;
+}
+
+static char *module_path_to_dir(const char *module_path) {
+    size_t i;
+    size_t j = 0;
+    size_t n;
+    char *d;
+    if (!module_path) {
+        return NULL;
+    }
+    n = strlen(module_path);
+    d = (char *)malloc(n + 1u);
+    if (!d) {
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        if (module_path[i] == ':' && i + 1u < n && module_path[i + 1u] == ':') {
+            d[j++] = '/';
+            i++;
+        } else {
+            d[j++] = module_path[i];
+        }
+    }
+    d[j] = '\0';
+    return d;
+}
+
+static int mod_name_cmp(const void *a, const void *b) {
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    return strcmp(sa, sb);
+}
+
+static int collect_glob_modules(const char *dir_path, const char *base_module, StrVec *out_mods) {
+    DIR *dp;
+    struct dirent *de;
+    int found = 0;
+    dp = opendir(dir_path);
+    if (!dp) {
+        return 0;
+    }
+    while ((de = readdir(dp)) != NULL) {
+        const char *nm = de->d_name;
+        size_t ln = strlen(nm);
+        char full[512];
+        if (ln < 6 || strcmp(nm + ln - 5u, ".mons") != 0) {
+            continue;
+        }
+        if (!is_ident_start_char(nm[0])) {
+            continue;
+        }
+        {
+            size_t i;
+            int ok = 1;
+            for (i = 1; i + 5u < ln; i++) {
+                if (!is_ident_char(nm[i])) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+        }
+        if (snprintf(full, sizeof(full), "%s::%.*s", base_module, (int)(ln - 5u), nm) >= (int)sizeof(full)) {
+            closedir(dp);
+            return -1;
+        }
+        if (!strvec_push_copy(out_mods, full)) {
+            closedir(dp);
+            return -1;
+        }
+        found = 1;
+    }
+    closedir(dp);
+    if (out_mods->len > 1) {
+        qsort(out_mods->items, out_mods->len, sizeof(char *), mod_name_cmp);
+    }
+    return found;
+}
+
+static int load_with_uses_rec(
+    const char *path,
+    StrVec *stack,
+    StrVec *loaded,
+    char **out,
+    size_t *out_len,
+    char *err,
+    size_t err_cap);
+
+static int resolve_and_load_module(
+    const char *module_name,
+    const char *dir,
+    const char *from_path,
+    StrVec *stack,
+    StrVec *loaded,
+    char **out,
+    size_t *out_len,
+    char *err,
+    size_t err_cap) {
+    char *mf = module_path_to_file(module_name);
+    char *cand = NULL;
+    char *cand2 = NULL;
+    int ok = 0;
+    if (!mf) {
+        (void)snprintf(err, err_cap, "out of memory");
+        return 0;
+    }
+    cand = path_join2(dir, mf);
+    if (cand && file_exists(cand)) {
+        ok = load_with_uses_rec(cand, stack, loaded, out, out_len, err, err_cap);
+    } else {
+        cand2 = path_join2(".", mf);
+        if (cand2 && file_exists(cand2)) {
+            ok = load_with_uses_rec(cand2, stack, loaded, out, out_len, err, err_cap);
+        } else {
+            (void)snprintf(err, err_cap, "cannot resolve module \"%s\" from \"%s\"",
+                           module_name,
+                           path_basename(from_path));
+            ok = 0;
+        }
+    }
+    free(cand);
+    free(cand2);
+    free(mf);
+    return ok;
 }
 
 static int load_with_uses_rec(
@@ -383,8 +605,10 @@ static int load_with_uses_rec(
         size_t start = 0;
         while (start < n) {
             size_t end = start;
-            char mod[256];
-            int use_kind;
+            char base_mod[256];
+            StrVec use_items = {0};
+            int use_kind = 0;
+            int use_glob = 0;
             while (end < n && src[end] != '\n') {
                 end++;
             }
@@ -396,47 +620,96 @@ static int load_with_uses_rec(
                 }
                 memcpy(line, src + start, ln);
                 line[ln] = '\0';
-                use_kind = parse_use_module_from_line(line, mod, sizeof(mod));
+                use_kind = parse_use_decl_from_line(line, base_mod, sizeof(base_mod), &use_items, &use_glob);
             }
             if (use_kind < 0) {
+                strvec_free(&use_items);
                 free(dir);
                 free(src);
                 strvec_pop(stack);
                 (void)snprintf(err, err_cap, "unsupported use syntax in \"%s\"", path_basename(path));
                 return 0;
             } else if (use_kind > 0) {
-                char *mf = module_path_to_file(mod);
-                char *cand = NULL;
-                char *cand2 = NULL;
-                int ok = 0;
-                if (!mf) {
-                    free(dir);
-                    free(src);
-                    strvec_pop(stack);
-                    (void)snprintf(err, err_cap, "out of memory");
-                    return 0;
-                }
-                cand = path_join2(dir, mf);
-                if (cand && file_exists(cand)) {
-                    ok = load_with_uses_rec(cand, stack, loaded, out, out_len, err, err_cap);
-                } else {
-                    cand2 = path_join2(".", mf);
-                    if (cand2 && file_exists(cand2)) {
-                        ok = load_with_uses_rec(cand2, stack, loaded, out, out_len, err, err_cap);
-                    } else {
-                        (void)snprintf(err, err_cap, "cannot resolve module \"%s\" from \"%s\"", mod, path_basename(path));
-                        ok = 0;
+                int ok = 1;
+                if (use_glob) {
+                    StrVec mods = {0};
+                    char *mdir = module_path_to_dir(base_mod);
+                    char *cand_dir = NULL;
+                    char *cand_dir2 = NULL;
+                    int found = 0;
+                    if (!mdir) {
+                        strvec_free(&use_items);
+                        free(dir);
+                        free(src);
+                        strvec_pop(stack);
+                        (void)snprintf(err, err_cap, "out of memory");
+                        return 0;
                     }
+                    cand_dir = path_join2(dir, mdir);
+                    if (cand_dir) {
+                        found = collect_glob_modules(cand_dir, base_mod, &mods);
+                    }
+                    if (found == 0) {
+                        cand_dir2 = path_join2(".", mdir);
+                        if (cand_dir2) {
+                            found = collect_glob_modules(cand_dir2, base_mod, &mods);
+                        }
+                    }
+                    free(mdir);
+                    free(cand_dir);
+                    free(cand_dir2);
+                    if (found <= 0) {
+                        strvec_free(&mods);
+                        strvec_free(&use_items);
+                        free(dir);
+                        free(src);
+                        strvec_pop(stack);
+                        if (found < 0) {
+                            (void)snprintf(err, err_cap, "out of memory");
+                        } else {
+                            (void)snprintf(err, err_cap, "cannot resolve module \"%s::*\" from \"%s\"",
+                                           base_mod,
+                                           path_basename(path));
+                        }
+                        return 0;
+                    }
+                    {
+                        size_t mi;
+                        for (mi = 0; mi < mods.len; mi++) {
+                            if (!resolve_and_load_module(
+                                    mods.items[mi], dir, path, stack, loaded, out, out_len, err, err_cap)) {
+                                ok = 0;
+                                break;
+                            }
+                        }
+                    }
+                    strvec_free(&mods);
+                } else if (use_items.len > 0) {
+                    size_t mi;
+                    for (mi = 0; mi < use_items.len; mi++) {
+                        char mod[512];
+                        if (snprintf(mod, sizeof(mod), "%s::%s", base_mod, use_items.items[mi]) >= (int)sizeof(mod)) {
+                            ok = 0;
+                            (void)snprintf(err, err_cap, "module path too long in \"%s\"", path_basename(path));
+                            break;
+                        }
+                        if (!resolve_and_load_module(mod, dir, path, stack, loaded, out, out_len, err, err_cap)) {
+                            ok = 0;
+                            break;
+                        }
+                    }
+                } else {
+                    ok = resolve_and_load_module(base_mod, dir, path, stack, loaded, out, out_len, err, err_cap);
                 }
-                free(cand);
-                free(cand2);
-                free(mf);
+                strvec_free(&use_items);
                 if (!ok) {
                     free(dir);
                     free(src);
                     strvec_pop(stack);
                     return 0;
                 }
+            } else {
+                strvec_free(&use_items);
             }
             if (end < n && src[end] == '\n') {
                 end++;

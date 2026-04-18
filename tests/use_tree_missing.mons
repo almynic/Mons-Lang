@@ -1,0 +1,5 @@
+use tests::use_tree::{alpha, missing};
+
+pub fn use_tree_missing() -> int {
+    alpha_value()
+}

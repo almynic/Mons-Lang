@@ -8,6 +8,7 @@ This file describes **syntax** and gives **examples**. For design goals and impl
 - [Lexical basics](#lexical-basics)
 - [Program structure](#program-structure)
 - [Top-level declarations](#top-level-declarations)
+  - [`use` imports](#use-imports)
 - [Types (Phase 1)](#types-phase-1)
 - [Statements](#statements)
 - [Expressions and precedence](#expressions-and-precedence)
@@ -104,6 +105,18 @@ pub fn twice(n: int) -> int {
     return n * 2;
 }
 ```
+
+### `use` imports
+
+The loader resolves `use` recursively before lex/parse. Supported forms:
+
+```mons
+use a::b;
+use a::{b, c};
+use a::*;
+```
+
+Current behavior is file-based and flattens imported declarations into one program (no namespacing yet).
 
 ---
 
@@ -326,7 +339,7 @@ Rough checklist for this repository’s lexer, parser, type checker, **tree-walk
 - Tooling: **`./mons -i`** interactive REPL; **`./mons path.mons`** typecheck-only; **`./mons --reflect FILE`** prints **`pub`** structs, functions, and constants from the type-checked AST; **`./mons --vm-test`** resolves `use` imports starting from **`tests/vm_smoke.mons`** (which imports **`stdlib/core.mons`**), then runs a fixed set of bytecode smoke entries (closures, control flow, **`for`**, arrays + tuples + **`[]`**, **`float`/`double`**, structs + **`..base`**, trait + inherent **`impl`**, …); no-arg driver runs the embedded eval demo. **`make test`** includes **`tests/stdlib_core.mons`** so stdlib **`use`** is typechecked in plain file mode.
 - **Lambdas:** `|x: T| expr`, `|| expr`, type inference on omitted param types; closures work in the **interpreter** and on the **bytecode** VM (after typecheck, inferred parameter types are materialized on the AST for lowering). **`OP_CLOSURE`** / upvalues implement captures on the VM.
 - **Inherent + trait `impl`:** `impl StructName { ... }` and non-generic `impl TraitName for StructName { ... }` are parsed and type-checked; methods are compiled to bytecode and callable as **`recv.method(…)`** (resolved to one target function by static receiver type during typecheck).
-- **Not** fully wired: full bytecode parity for **`return` inside `try` / `catch` / `finally`** (current compiler rejects that form), macro expansion, selective/glob `use` imports (`use foo::{a,b}` / `*`), every **`match`** pattern the EBNF allows (bytecode rejects some — README), and much of the full EBNF surface beyond what the README lists. Runtime composites use a hybrid memory strategy (refcount plus tracing sweep) so unreachable cycles can be reclaimed.
+- **Not** fully wired: full bytecode parity for **`return` inside `try` / `catch` / `finally`** (current compiler rejects that form), macro expansion, every **`match`** pattern the EBNF allows (bytecode rejects some — README), package-boundary module semantics, and much of the full EBNF surface beyond what the README lists. Runtime composites use a hybrid memory strategy (refcount plus tracing sweep) so unreachable cycles can be reclaimed.
 
 When in doubt, compare with [mons_grammar.ebnf](mons_grammar.ebnf) and the “implemented today” table in [README.md](README.md).
 
@@ -336,6 +349,6 @@ When in doubt, compare with [mons_grammar.ebnf](mons_grammar.ebnf) and the “im
 
 The EBNF also describes features intended for later stages, including:
 
-- **Generic** traits/impls, **trait objects**, default trait methods, selective/glob **`use`**, full **`try` parity with `return` in bytecode try regions**, generics on functions and structs, and `macro` definitions with `name!(...)` invocations. Top-level **`use a::b;`** (single path, no braces) and bytecode **`try/catch/finally/throw`** are implemented. **`match`** is implemented for a growing subset (see README for bytecode gaps).
+- **Generic** traits/impls, **trait objects**, default trait methods, full **`try` parity with `return` in bytecode try regions**, generics on functions and structs, and `macro` definitions with `name!(...)` invocations. Top-level `use` supports plain, selective, and glob forms; bytecode **`try/catch/finally/throw`** is implemented. **`match`** is implemented for a growing subset (see README for bytecode gaps).
 
 Treat items as **design targets** unless the README explicitly lists them as implemented for the backend you care about (interpreter vs bytecode).

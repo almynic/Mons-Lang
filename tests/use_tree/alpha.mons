@@ -1,0 +1,3 @@
+pub fn alpha_value() -> int {
+    10
+}

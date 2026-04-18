@@ -24,10 +24,13 @@ run: $(BIN)
 test: $(BIN)
 	./$(BIN) tests/smoke.mons
 	./$(BIN) tests/stdlib_core.mons
+	./$(BIN) tests/use_tree_ok.mons
 	./$(BIN) tests/closure.mons
 	./$(BIN) tests/trait_impl.mons
 	! ./$(BIN) tests/use_missing.mons > /dev/null 2>&1
+	! ./$(BIN) tests/use_tree_missing.mons > /dev/null 2>&1
 	! ./$(BIN) tests/use_cycle_a.mons > /dev/null 2>&1
+	! ./$(BIN) tests/use_cycle_tree_a.mons > /dev/null 2>&1
 	./$(BIN) --reflect tests/smoke.mons > /dev/null
 	./$(BIN) --vm-test
 

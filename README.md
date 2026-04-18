@@ -39,9 +39,9 @@ Mons prefers expressions over statements, immutability over mutation, and compos
 | Error handling | `Result[T, E]` + `match`; `try/catch/finally/throw` on both tree-walk and bytecode (with noted VM limits) |
 | Metaprogramming | AST macros, runtime reflection, compile-time codegen |
 | Implementation | Written in C, zero dependencies |
-| Status | **Phase 1** tree-walk complete; **Phase 2 (closed scope)** complete — stack bytecode **2A–2C**, `use`, traits (MVP), hybrid GC, stdlib slice, bytecode `try/catch/finally/throw` (current VM limit: `return` inside `try` regions), **`--vm-test`** / **`--reflect`** ([DESIGN.md — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete)). **Phase 2+** / **Phase 3** prep: macros, richer `use`, full stdlib, register VM, etc. |
+| Status | **Phase 1** tree-walk complete; **Phase 2 (closed scope)** complete — stack bytecode **2A–2C**, `use` (single path + selective + glob), traits (MVP), hybrid GC, stdlib slice, bytecode `try/catch/finally/throw` (current VM limit: `return` inside `try` regions), **`--vm-test`** / **`--reflect`** ([DESIGN.md — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete)). **Phase 2+** / **Phase 3** prep: macros, full stdlib, register VM, etc. |
 
-The **language tour** below describes the *target* Mons design. The **reference implementation** delivers **Phase 1** (lex → parse → typecheck → eval) plus **Phase 2** bytecode for the [closed scope in DESIGN](DESIGN.md#phase-2-closed-scope-complete). **`./mons path.mons`** typechecks a file; **`./mons -i`** runs the REPL; **`make test`** runs typecheck fixtures, **`--reflect`**, and **`--vm-test`**. **Phase 2+** highlights: **generic** traits/impls, **AST macros**, selective/glob **`use`**, and bytecode **`match`** gaps versus the interpreter (see **Bytecode vs interpreter**). Bytecode now supports **`try`/`catch`/`finally`/`throw`** with one current limitation: **`return` inside `try`/`catch`/`finally` regions is not lowered yet**. **Trait `impl Trait for Type`** (non-generic) uses **`resolved_fn`** on both backends. **`use module::path;`** resolves recursively with duplicate suppression and cycle detection.
+The **language tour** below describes the *target* Mons design. The **reference implementation** delivers **Phase 1** (lex → parse → typecheck → eval) plus **Phase 2** bytecode for the [closed scope in DESIGN](DESIGN.md#phase-2-closed-scope-complete). **`./mons path.mons`** typechecks a file; **`./mons -i`** runs the REPL; **`make test`** runs typecheck fixtures, **`--reflect`**, and **`--vm-test`**. **Phase 2+** highlights: **generic** traits/impls, **AST macros**, and bytecode **`match`** gaps versus the interpreter (see **Bytecode vs interpreter**). Bytecode now supports **`try`/`catch`/`finally`/`throw`** with one current limitation: **`return` inside `try`/`catch`/`finally` regions is not lowered yet**. **Trait `impl Trait for Type`** (non-generic) uses **`resolved_fn`** on both backends. `use` supports plain (`use a::b;`), selective (`use a::{b,c};`), and glob (`use a::*;`) forms with recursive resolution, duplicate suppression, and cycle detection.
 
 ---
 
@@ -386,6 +386,7 @@ mons-lang/
 ├── tests/
 │   ├── smoke.mons          # `make test` — parse + typecheck (`bump(K)`)
 │   ├── stdlib_core.mons    # `make test` — `use stdlib::core` typecheck
+│   ├── use_tree_ok.mons    # `make test` — selective + glob `use` forms
 │   ├── closure.mons        # `make test` — lambdas, captures, nested λ (typecheck)
 │   └── vm_smoke.mons       # `--vm-test`: imports stdlib, VM smokes (closures, `for`, traits, …)
 │
@@ -416,7 +417,7 @@ mons-lang/
     └── ast_print.c         # Debug AST printer
 ```
 
-*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — stack VM, multi-chunk calls, closures (inferred params + empty-param lambdas), arrays/tuples/`[]`/`for` (incl. homogeneous tuples), floats/doubles, structs + `..base` + inherent/trait `impl`, field opcodes, subset **`match`**, bytecode **`try/catch/finally/throw`** (current limit: no `return` inside try regions), hybrid refcount+tracing GC. Phase 2C: `reflection.c`, `stdlib/core.mons` via **`use`**. **Phase 2** is **closed** for this slice — see [DESIGN — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete); **Phase 2+**: richer `use`, fuller **`match`** on VM.)*
+*(Bytecode: `bytecode.c`, `compile.c`, `vm.c` — stack VM, multi-chunk calls, closures (inferred params + empty-param lambdas), arrays/tuples/`[]`/`for` (incl. homogeneous tuples), floats/doubles, structs + `..base` + inherent/trait `impl`, field opcodes, subset **`match`**, bytecode **`try/catch/finally/throw`** (current limit: no `return` inside try regions), hybrid refcount+tracing GC. Phase 2C: `reflection.c`, `stdlib/core.mons` via **`use`**. **Phase 2** is **closed** for this slice — see [DESIGN — Phase 2 closed scope](DESIGN.md#phase-2-closed-scope-complete); **Phase 2+**: fuller **`match`** on VM.)*
 
 ---
 
@@ -443,7 +444,7 @@ make test           # typecheck smoke.mons + `--reflect` + bytecode VM smoke (`-
 
 **REPL tips:** end a line with **`\\`** to continue on the next line, or leave **`{`** unclosed until the matching **`}`** (prompt shows `...`). Commands: **`:help`**, **`:clear`**, **`:quit`** (or EOF).
 
-**CI:** `make test` runs `./mons tests/smoke.mons`, `./mons tests/stdlib_core.mons`, `./mons tests/closure.mons`, `./mons tests/trait_impl.mons`, negative checks on `tests/use_missing.mons` and `tests/use_cycle_a.mons`, `./mons --reflect tests/smoke.mons`, and `./mons --vm-test`; all must exit as specified.
+**CI:** `make test` runs `./mons tests/smoke.mons`, `./mons tests/stdlib_core.mons`, `./mons tests/use_tree_ok.mons`, `./mons tests/closure.mons`, `./mons tests/trait_impl.mons`, negative checks on `tests/use_missing.mons`, `tests/use_tree_missing.mons`, `tests/use_cycle_a.mons`, and `tests/use_cycle_tree_a.mons`, `./mons --reflect tests/smoke.mons`, and `./mons --vm-test`; all must exit as specified.
 
 ---
 

@@ -2085,6 +2085,10 @@ static AstNode *parse_use_decl_rest(Parser *p, Token *t_use) {
     }
 
     while (match(p, TOK_PATH_SEP)) {
+        if (match(p, TOK_STAR)) {
+            glob = true;
+            break;
+        }
         if (match(p, TOK_LBRACE)) {
             if (match(p, TOK_STAR)) {
                 glob = true;

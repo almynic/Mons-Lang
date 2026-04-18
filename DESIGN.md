@@ -518,7 +518,7 @@ Rationale: a stack VM is quicker to land than a register allocator; the opcode l
 - **Lambdas / closures (tree-walk):** Parser accepts `|params| body` and `|| body` (Rust-style empty params); parameters may omit types for inference. The type checker builds **`TY_FN`** with lexical capture via the environment chain. **`eval`** represents closures as **`VAL_CLOSURE`** (captured names + values at creation time; **`fv_`** walk finds free variables). **Calls** dispatch on **`VAL_CLOSURE`** or top-level **`NODE_FN_DECL`**. Nested lambdas and higher-order calls (`mk(5)(7)`) work.
 - **Lambdas / closures (bytecode):** **`compile_program_bc`** compiles **`NODE_LAMBDA`** (including inferred parameter types — the type checker **materializes** `NODE_PARAM.type` and optional **`lambda.ret_type`** on the AST after inference). Body is a separate chunk with **`OP_GET_UPVALUE`** for captures. **`OP_CLOSURE`** records which enclosing locals/upvalues fill the closure cells. Interpreter-only closures use **`is_bytecode == false`** and **`lambda != NULL`**; VM closures use **`is_bytecode == true`**, **`lambda == NULL`**, and **`bc_chunk_idx`**. **`eval_invoke_closure`** refuses bytecode closures (VM-only).
 - **Done:** hybrid memory management for runtime composites: refcount fast-path + tracing sweep to reclaim unreachable cycles.
-- **Deferred:** richer module features (`use foo::{...}`, glob imports, package boundaries), and any remaining **lambda body** gaps on bytecode versus the interpreter (only if new surface appears).
+- **Deferred:** package boundaries and any remaining **lambda body** gaps on bytecode versus the interpreter (only if new surface appears).
 
 **Milestone (Phase 2 in this repo):** the staged **2A–2C** bytecode path, **`use`**, trait dispatch, hybrid GC, bytecode **`try/catch/finally/throw`** (with documented limits), a **stdlib** slice, and **`--vm-test`** are complete for the [closed scope](#phase-2-closed-scope-complete) below. **Long-term:** register VM tuning and a full standard library remain **Phase 2+** / **Phase 3** prep.
 
@@ -533,7 +533,7 @@ Delivered in **mergeable slices**. **Normative “Phase 2 complete”** for this
 | 3 | **`match` (parser → types → eval + bytecode)** | 2 recommended | **Done** — `match` parses (including `Option::None` as `TOK_NONE` after `::`); exhaustiveness for bool / `Option` / scalars / struct (`_` required); tree-walk + bytecode for literals, `_`, binds, `Option::None` / `Option::Some` (1-tuple runtime), struct fields; `|` without bindings; bytecode skips `|` patterns, `Option::Some` inner literals, and defers some enum/struct edges — see README; `smoke_match_*` in `--vm-test`; `tests/closure.mons` match cases; README / LANGUAGE updated. |
 | 4 | **`try` / `catch` / `finally`** | 3 optional (orthogonal) | **Done (MVP on both backends)** — parse, typecheck, tree-walk eval, and bytecode VM support `try/catch/finally/throw`; `finally` runs on success and throw paths; VM smoke covers basic/cross-call throw + finally. **Known VM gap:** `return` inside `try`/`catch`/`finally` regions is not lowered yet (compile-time rejection). |
 | 5 | **Trait `impl Trait for Type` + dispatch** | 3 recommended (stable calls) | **Done (MVP)** — parse `trait { fn …; }`, `impl Trait for Type { … }`; checker registers traits, checks impl signatures vs trait (structural AST match on params/returns), rejects generics/supertraits; **no vtable**: `r.m()` resolves by **static receiver type** to a single `NODE_FN_DECL` stored as **`method_call.resolved_fn`** (same index model as inherent `impl`); interpreter + bytecode use it; `tests/trait_impl.mons` + `smoke_trait_bump` in `--vm-test`; default trait methods / `Self` / trait objects remain Phase 2+. |
-| 6 | **`use` / modules** | 5 recommended | **Done (MVP)** — top-level `use module::path;` parses into `NODE_USE_DECL`; loader resolves imports recursively before lex/parse, de-duplicates modules, and detects cycles; unresolved imports and cycles are tested (`tests/use_missing.mons`, `tests/use_cycle_a.mons`); `--vm-test` relies on `use stdlib::core;` from `tests/vm_smoke.mons`; selective/glob `use` remains future. |
+| 6 | **`use` / modules** | 5 recommended | **Done** — top-level `use` supports plain (`use a::b;`), selective (`use a::{b,c};`), and glob (`use a::*;`) forms; loader resolves imports recursively before lex/parse, de-duplicates modules, and detects cycles; unresolved imports and cycles are tested (`tests/use_missing.mons`, `tests/use_tree_missing.mons`, `tests/use_cycle_a.mons`, `tests/use_cycle_tree_a.mons`); `--vm-test` relies on `use stdlib::core;` from `tests/vm_smoke.mons`. |
 | 7 | **Tracing GC (or hybrid)** | Stable object graph: at minimum 1–3 | **Done (hybrid)** — runtime keeps refcount semantics and tracks heap composites globally; `value_gc_collect(...)` marks from roots and sweeps unreachable objects (including cycles). VM and interpreter invoke sweep at call boundaries preserving returned roots. `run_gc_stress_test()` in `--vm-test` builds synthetic cycles and verifies live-object count returns to baseline. |
 | 8 | **Stdlib “real” prelude** | 6 strongly preferred | **Done** — `stdlib/core.mons` holds documented int helpers; **`tests/stdlib_core.mons`** + **`tests/vm_smoke.mons`** load it with **`use stdlib::core;`** (`make test` and **`--vm-test`**); README tour calls out builtins not in-tree yet vs `stdlib/core.mons`. |
 | 9 | **Phase 2 “closed” documentation** | 1–8 per scope | **Done** — [Phase 2 closed scope](#phase-2-closed-scope-complete) below; `make test` green; README milestone matches this section. |
@@ -553,7 +553,7 @@ The **Phase 2** milestone in this repository means: **Phase 1** tree-walk (`eval
 
 - **Full parity for `try` with `return`-interaction on bytecode** (current VM lowers try/catch/finally/throw but rejects `return` inside those regions).
 - **AST macro expansion** before typecheck (`macro.c` pipeline).
-- **Selective / glob `use`**, package layout, richer module system.
+- **Package layout / boundaries**, richer module system semantics beyond file-based loading.
 - **Generics**, **trait objects**, default trait methods, **`Self`** in traits (non-generic trait **`impl`** only).
 - **Register-based** VM frames, generational GC, and other performance engineering.
 - **Native code** backends (**Phase 3**).
@@ -627,7 +627,7 @@ mons-lang/
     └── main.c              # Pipeline entry (embedded demo, file path, REPL, --vm-test, --reflect)
 
 # Phase 2 (closed scope): bytecode 2A–2C, reflection, stdlib/core.mons via use, hybrid GC, trait impl + match subset + try/catch/finally/throw on both backends (VM gap: return inside try regions) — see “Phase 2 closed scope (complete)” above
-# Phase 2+: full try/return parity on VM, macro pass, richer use, full stdlib, register VM, remaining match/forms
+# Phase 2+: full try/return parity on VM, macro pass, full stdlib, register VM, remaining match/forms
 ```
 
 ---

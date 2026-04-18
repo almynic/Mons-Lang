@@ -1,0 +1,5 @@
+use tests::use_cycle_tree::{b};
+
+pub fn use_cycle_tree_a() -> int {
+    b_value()
+}

@@ -1,0 +1,6 @@
+use tests::use_tree::{alpha, beta};
+use tests::use_tree::*;
+
+pub fn use_tree_ok() -> int {
+    alpha_value() + beta_value() + gamma_value()
+}

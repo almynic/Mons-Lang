@@ -1,0 +1,3 @@
+pub fn gamma_value() -> int {
+    3
+}
