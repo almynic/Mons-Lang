@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define BC_NO_STRUCT 255u
+#define BC_RETURN_SENTINEL "__mons_bc_return__"
 
 typedef struct Ctx Ctx;
 
@@ -249,6 +250,7 @@ static bool bc_intern_symbol(CompileProgramResult *r, const char *s, uint16_t *o
 
 static void compile_expr(Ctx *c, AstNode *n);
 static void compile_match_expr(Ctx *c, AstNode *n);
+static void emit_throw_return_signal(Ctx *c, AstNode *ret_value);
 
 static void compile_struct_init(Ctx *c, AstNode *n) {
     const char *sname;
@@ -265,6 +267,10 @@ static void compile_struct_init(Ctx *c, AstNode *n) {
         return;
     }
     sname = AS_STRUCT_INIT(n).struct_name;
+    if (AS_STRUCT_INIT(n).type_args) {
+        compile_fail(c, "generic struct literals are not supported in bytecode yet");
+        return;
+    }
     li = struct_layout_named(c->bc, sname);
     decl = lookup_struct_decl_node(c->program, sname);
     if (li < 0 || !decl) {
@@ -524,14 +530,17 @@ static void compile_block_ex(Ctx *c, AstNode *blk, bool trailing_return) {
             }
             case NODE_RETURN:
                 if (c->try_depth > 0 || c->in_finally > 0) {
-                    compile_fail(c, "bytecode return inside try/catch/finally is not supported yet");
-                    return;
+                    emit_throw_return_signal(c, AS_RETURN(st).value);
+                    if (c->error) {
+                        return;
+                    }
+                } else {
+                    compile_expr(c, AS_RETURN(st).value);
+                    if (c->error) {
+                        return;
+                    }
+                    chunk_emit_u8(c->chunk, OP_RETURN);
                 }
-                compile_expr(c, AS_RETURN(st).value);
-                if (c->error) {
-                    return;
-                }
-                chunk_emit_u8(c->chunk, OP_RETURN);
                 return;
             case NODE_EXPR_STMT:
                 compile_expr(c, AS_EXPR_STMT(st).expr);
@@ -893,19 +902,22 @@ static void compile_block_as_value(Ctx *c, AstNode *blk) {
                 break;
             }
             case NODE_RETURN:
-                if (c->try_depth > 0 || c->in_finally > 0) {
-                    compile_fail(c, "bytecode return inside try/catch/finally is not supported yet");
-                    return;
-                }
                 if (!AS_RETURN(st).value) {
                     compile_fail(c, "bare return in branch block not supported in bytecode yet");
                     return;
                 }
-                compile_expr(c, AS_RETURN(st).value);
-                if (c->error) {
-                    return;
+                if (c->try_depth > 0 || c->in_finally > 0) {
+                    emit_throw_return_signal(c, AS_RETURN(st).value);
+                    if (c->error) {
+                        return;
+                    }
+                } else {
+                    compile_expr(c, AS_RETURN(st).value);
+                    if (c->error) {
+                        return;
+                    }
+                    chunk_emit_u8(c->chunk, OP_RETURN);
                 }
-                chunk_emit_u8(c->chunk, OP_RETURN);
                 return;
             case NODE_EXPR_STMT:
                 compile_expr(c, AS_EXPR_STMT(st).expr);
@@ -1021,6 +1033,37 @@ static void emit_push_const_value(Ctx *c, Value v) {
     }
     chunk_emit_u8(c->chunk, OP_PUSH_CONST);
     chunk_emit_u16(c->chunk, (uint16_t)idx);
+}
+
+static void emit_throw_return_signal(Ctx *c, AstNode *ret_value) {
+    Value sv;
+    char *sdup;
+    if (!ret_value) {
+        compile_fail(c, "bytecode bare return is not supported");
+        return;
+    }
+    sv.kind = VAL_STRING;
+    sdup = strdup(BC_RETURN_SENTINEL);
+    if (!sdup) {
+        compile_fail(c, "out of memory");
+        return;
+    }
+    sv.as.s = sdup;
+    emit_push_const_value(c, sv);
+    if (c->error) {
+        Value dv;
+        dv.kind = VAL_STRING;
+        dv.as.s = sdup;
+        value_release(&dv);
+        return;
+    }
+    compile_expr(c, ret_value);
+    if (c->error) {
+        return;
+    }
+    chunk_emit_u8(c->chunk, OP_TUPLE_NEW);
+    chunk_emit_u16(c->chunk, 2);
+    chunk_emit_u8(c->chunk, OP_THROW);
 }
 
 /* Emit pattern test; on failure pops the bool and jumps (u16 placeholder patched to next arm).
@@ -1690,6 +1733,10 @@ static void compile_expr(Ctx *c, AstNode *n) {
                 compile_fail(c, "internal: call");
                 return;
             }
+            if (AS_CALL(n).type_args) {
+                compile_fail(c, "generic function calls are not supported in bytecode yet");
+                return;
+            }
 
             if (cal->kind == NODE_IDENT) {
                 const char *nm = AS_IDENT(cal).name;
@@ -2032,17 +2079,16 @@ static void compile_expr(Ctx *c, AstNode *n) {
             return;
         }
         case NODE_METHOD_CALL: {
-            const char *mname = AS_METHOD_CALL(n).method;
             int fidx;
             AstNode *mfn;
             size_t expect;
             size_t nargs;
             AstList *arg;
-            if (AS_METHOD_CALL(n).resolved_fn) {
-                fidx = bc_fn_decl_index(c->program, AS_METHOD_CALL(n).resolved_fn);
-            } else {
-                fidx = fn_name_to_index(c->program, mname);
+            if (!AS_METHOD_CALL(n).resolved_fn) {
+                compile_fail(c, "bytecode requires a resolved method target (bounded generic methods are not lowered yet)");
+                return;
             }
+            fidx = bc_fn_decl_index(c->program, AS_METHOD_CALL(n).resolved_fn);
             if (fidx < 0) {
                 compile_fail(c, "unknown method in bytecode");
                 return;

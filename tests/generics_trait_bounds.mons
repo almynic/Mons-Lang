@@ -1,0 +1,40 @@
+// Generic structs/functions with trait bounds; method calls on type parameters `T: Trait`
+// use trait signatures (turbofish `f::<T>(...)`, `Ty::<T> { ... }`, types `Ty[U]`).
+// Eval resolves methods by runtime struct name when `resolved_fn` is null.
+
+trait Desc {
+    fn d(self: Self) -> int;
+}
+
+struct Data {
+    x: int,
+}
+
+impl Desc for Data {
+    fn d(self: Data) -> int {
+        self.x
+    }
+}
+
+struct Wrap[T: Desc] {
+    n: int,
+}
+
+fn pick[U: Desc](a: U, b: U) -> int {
+    a.d() + b.d()
+}
+
+fn field_x[T: Desc](t: T) -> int {
+    t.x
+}
+
+fn bump[T](k: int) -> int {
+    k + 1
+}
+
+pub fn generics_trait_bounds_ok() -> int {
+    let w: Wrap[Data] = Wrap::<Data> { n: 7, };
+    let d1: Data = Data { x: 1, };
+    let d2: Data = Data { x: 2, };
+    bump::<int>(pick::<Data>(d1, d2) + field_x::<Data>(d1) + w.n)
+}

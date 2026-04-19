@@ -102,6 +102,7 @@ typedef enum {
     NODE_TYPE_RESULT,
     NODE_TYPE_TUPLE,
     NODE_TYPE_REF,
+    NODE_TYPE_SELF, /* `Self` in trait signatures; substituted when typing bounded calls */
 
     /* ── Patterns ── */
     NODE_PAT_WILDCARD,
@@ -379,6 +380,7 @@ typedef struct AstNode {
             const char     *struct_name;
             AstList        *fields;     /* list of NODE_FIELD_INIT */
             struct AstNode *base;       /* struct update syntax "..base", or NULL */
+            AstList        *type_args;  /* NULL unless `Name::<T, U> { ... }` */
         } struct_init;
 
         /* ── NODE_FIELD_INIT ──────────────────────────────────── */
@@ -453,6 +455,11 @@ typedef struct AstNode {
             struct AstNode *inner;
             bool            is_mut;
         } type_ref;
+
+        /* NODE_TYPE_SELF — marker only (trait receiver / substitution) */
+        struct {
+            uint8_t _reserved;
+        } type_self;
 
         /* ── Patterns ─────────────────────────────────────────── */
 
@@ -555,6 +562,7 @@ typedef struct AstNode {
 #define AS_TYPE_RESULT(n)   ((n)->as.type_result)
 #define AS_TYPE_TUPLE(n)    ((n)->as.type_tuple)
 #define AS_TYPE_REF(n)      ((n)->as.type_ref)
+#define AS_TYPE_SELF(n)     ((n)->as.type_self)
 #define AS_PAT_LIT(n)       ((n)->as.pat_literal)
 #define AS_PAT_BIND(n)      ((n)->as.pat_bind)
 #define AS_PAT_ENUM(n)      ((n)->as.pat_enum)

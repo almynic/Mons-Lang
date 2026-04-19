@@ -848,6 +848,48 @@ static AstNode *lookup_struct_decl(AstNode *program, const char *name) {
     return NULL;
 }
 
+/* Resolve `recv.method` when the type checker left `resolved_fn` null (bounded type parameter calls). */
+static AstNode *lookup_method_fn_for_struct(AstNode *program, const char *struct_type_name, const char *method_name) {
+    AstList *d;
+    AstList *m;
+
+    if (!program || program->kind != NODE_PROGRAM || !struct_type_name || !method_name) {
+        return NULL;
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(d->item).name, method_name) == 0) {
+            AstNode *fn = d->item;
+            AstNode *p0;
+            if (!AS_FN_DECL(fn).params || !AS_FN_DECL(fn).params->item) {
+                continue;
+            }
+            p0 = AS_FN_DECL(fn).params->item;
+            if (strcmp(AS_PARAM(p0).name, "self") != 0 || !AS_PARAM(p0).type ||
+                AS_PARAM(p0).type->kind != NODE_TYPE_NAMED) {
+                continue;
+            }
+            if (strcmp(AS_TYPE_NAMED(AS_PARAM(p0).type).name, struct_type_name) == 0) {
+                return fn;
+            }
+        }
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind != NODE_IMPL_DECL) {
+            continue;
+        }
+        if (strcmp(AS_IMPL_DECL(d->item).struct_name, struct_type_name) != 0) {
+            continue;
+        }
+        for (m = AS_IMPL_DECL(d->item).methods; m; m = m->next) {
+            AstNode *fn = m->item;
+            if (fn && fn->kind == NODE_FN_DECL && strcmp(AS_FN_DECL(fn).name, method_name) == 0) {
+                return fn;
+            }
+        }
+    }
+    return NULL;
+}
+
 static size_t struct_field_index(AstNode *struct_decl, const char *field_name) {
     AstList *fl;
     size_t j = 0;
@@ -1504,33 +1546,39 @@ static Value eval_expr(EvalCtx *ctx, AstNode *n) {
             {
                 const char *mname = AS_METHOD_CALL(n).method;
                 AstNode *fn = AS_METHOD_CALL(n).resolved_fn;
-                if (!fn) {
-                    fn = lookup_fn(ctx->program, mname);
-                }
                 size_t nparam;
                 size_t argc;
                 Value *argv;
                 AstList *al;
                 size_t i;
                 Value recv;
+
+                recv = eval_expr(ctx, AS_METHOD_CALL(n).receiver);
+                if (ctx->error) {
+                    return val_void();
+                }
+                if (!fn && recv.kind == VAL_STRUCT && recv.as.st && recv.as.st->type_name) {
+                    fn = lookup_method_fn_for_struct(ctx->program, recv.as.st->type_name, mname);
+                }
                 if (!fn) {
+                    fn = lookup_fn(ctx->program, mname);
+                }
+                if (!fn) {
+                    value_release(&recv);
                     eval_fail(ctx, "call to unknown function");
                     return val_void();
                 }
                 nparam = ast_list_len(AS_FN_DECL(fn).params);
                 argc = 1 + ast_list_len(AS_METHOD_CALL(n).args);
                 if (argc != nparam) {
+                    value_release(&recv);
                     eval_fail_fmt(ctx, "wrong argument count (expected %ld)", (long)nparam);
                     return val_void();
                 }
                 argv = (Value *)malloc(argc * sizeof(Value));
                 if (!argv && argc > 0) {
+                    value_release(&recv);
                     eval_fail(ctx, "out of memory");
-                    return val_void();
-                }
-                recv = eval_expr(ctx, AS_METHOD_CALL(n).receiver);
-                if (ctx->error) {
-                    free(argv);
                     return val_void();
                 }
                 argv[0] = recv;

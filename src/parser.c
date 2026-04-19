@@ -26,6 +26,7 @@ typedef struct Parser {
     uint32_t err_line;
     uint32_t err_col;
     char errbuf[192]; /* expect() formats here so p->error is not a dangling stack pointer */
+    AstList *generic_tyargs_pending; /* from `name::<...>` before `{` struct literal */
 } Parser;
 
 static SrcLoc tok_loc(const Parser *p, const Token *t) {
@@ -307,6 +308,22 @@ static AstNode *parse_type(Parser *p) {
         const char *nm = expect_ident_copy(p);
         if (p->error || !nm) {
             return NULL;
+        }
+
+        if (ident_text_is(nm, "Self")) {
+            if (match(p, TOK_LBRACKET)) {
+                parser_error(p, peek(p), "`Self` does not take type arguments");
+                return NULL;
+            }
+            {
+                AstNode *sn = ast_alloc(NODE_TYPE_SELF, loc);
+                if (!sn) {
+                    parser_error(p, ti, "out of memory");
+                    return NULL;
+                }
+                AS_TYPE_SELF(sn)._reserved = 0;
+                return sn;
+            }
         }
 
         if (ident_text_is(nm, "Option") && match(p, TOK_LBRACKET)) {
@@ -883,7 +900,76 @@ static bool ident_looks_like_struct_type_name(const char *name) {
 }
 
 static AstNode *parse_postfix(Parser *p, AstNode *n) {
+    p->generic_tyargs_pending = NULL;
     for (;;) {
+        if (p->generic_tyargs_pending && !check(p, TOK_LBRACE)) {
+            parser_error(p, peek(p), "expected '{' after `::<...>` for generic struct literal (or use `f::<T>(...)`)");
+            return NULL;
+        }
+        if (n->kind == NODE_IDENT && check(p, TOK_PATH_SEP)) {
+            Token *tsep = peek(p);
+            (void)tsep;
+            p->i++;
+            if (!match(p, TOK_LT)) {
+                parser_error(p, peek(p), "expected '<' after `::` (generic syntax is `name::<T>(...)` or `Type::<T> { ... }`)");
+                return NULL;
+            }
+            {
+                AstList *tyargs = NULL;
+                if (!check(p, TOK_GT)) {
+                    do {
+                        AstNode *ta = parse_type(p);
+                        if (p->error || !ta) {
+                            return NULL;
+                        }
+                        tyargs = ast_list_append(tyargs, ta);
+                        if (!tyargs) {
+                            parser_error(p, peek(p), "out of memory");
+                            return NULL;
+                        }
+                    } while (match(p, TOK_COMMA));
+                }
+                expect(p, TOK_GT, "'>' after type arguments");
+                if (p->error) {
+                    return NULL;
+                }
+                if (match(p, TOK_LPAREN)) {
+                    AstList *args = NULL;
+                    if (!check(p, TOK_RPAREN)) {
+                        do {
+                            AstNode *a = parse_expr(p);
+                            if (p->error || !a) {
+                                return NULL;
+                            }
+                            args = ast_list_append(args, a);
+                            if (!args) {
+                                parser_error(p, peek(p), "out of memory");
+                                return NULL;
+                            }
+                        } while (match(p, TOK_COMMA));
+                    }
+                    expect(p, TOK_RPAREN, "')' after call arguments");
+                    if (p->error) {
+                        return NULL;
+                    }
+                    {
+                        AstNode *call = ast_alloc(NODE_CALL, n->loc);
+                        if (!call) {
+                            parser_error(p, peek(p), "out of memory");
+                            return NULL;
+                        }
+                        AS_CALL(call).callee = n;
+                        AS_CALL(call).args = args;
+                        AS_CALL(call).type_args = tyargs;
+                        n = call;
+                        p->generic_tyargs_pending = NULL;
+                        continue;
+                    }
+                }
+                p->generic_tyargs_pending = tyargs;
+                continue;
+            }
+        }
         if (match(p, TOK_DOT)) {
             const char *field = expect_ident_copy(p);
             if (p->error || !field) {
@@ -992,6 +1078,8 @@ static AstNode *parse_postfix(Parser *p, AstNode *n) {
             AS_STRUCT_INIT(si).struct_name = sname;
             AS_STRUCT_INIT(si).fields = NULL;
             AS_STRUCT_INIT(si).base = NULL;
+            AS_STRUCT_INIT(si).type_args = p->generic_tyargs_pending;
+            p->generic_tyargs_pending = NULL;
             if (!parse_field_inits(p, si)) {
                 return NULL;
             }
@@ -1000,6 +1088,10 @@ static AstNode *parse_postfix(Parser *p, AstNode *n) {
         }
 
         break;
+    }
+    if (p->generic_tyargs_pending) {
+        parser_error(p, peek(p), "incomplete `::<...>` (expected '{' or '(')");
+        return NULL;
     }
     return n;
 }
@@ -2172,17 +2264,6 @@ static AstNode *parse_use_decl_rest(Parser *p, Token *t_use) {
     return n;
 }
 
-static void impl_names_free(const char *trait_name, const char *struct_name) {
-    if (trait_name) {
-        free((void *)trait_name);
-        if (struct_name) {
-            free((void *)struct_name);
-        }
-    } else if (struct_name) {
-        free((void *)struct_name);
-    }
-}
-
 static AstNode *parse_impl_decl_rest(Parser *p, bool is_pub, Token *t_impl) {
     AstList *gp_impl;
     AstList *gp_type = NULL;
@@ -2208,7 +2289,6 @@ static AstNode *parse_impl_decl_rest(Parser *p, bool is_pub, Token *t_impl) {
         trait_name = name_a;
         struct_name = expect_ident_copy(p);
         if (p->error || !struct_name) {
-            impl_names_free(trait_name, NULL);
             return NULL;
         }
     } else {
@@ -2217,13 +2297,11 @@ static AstNode *parse_impl_decl_rest(Parser *p, bool is_pub, Token *t_impl) {
 
     gp_type = parse_generic_params(p);
     if (p->error) {
-        impl_names_free(trait_name, struct_name);
         return NULL;
     }
 
     expect(p, TOK_LBRACE, "'{' to start impl body");
     if (p->error) {
-        impl_names_free(trait_name, struct_name);
         return NULL;
     }
 
@@ -2245,20 +2323,17 @@ static AstNode *parse_impl_decl_rest(Parser *p, bool is_pub, Token *t_impl) {
     }
 
     if (p->error) {
-        impl_names_free(trait_name, struct_name);
         return NULL;
     }
 
     expect(p, TOK_RBRACE, "'}' after impl body");
     if (p->error) {
-        impl_names_free(trait_name, struct_name);
         return NULL;
     }
 
     n = ast_alloc(NODE_IMPL_DECL, tok_loc(p, t_impl));
     if (!n) {
         parser_error(p, t_impl, "out of memory");
-        impl_names_free(trait_name, struct_name);
         return NULL;
     }
     AS_IMPL_DECL(n).struct_name = struct_name;
@@ -2545,7 +2620,7 @@ ParseResult parse_tokens(TokenArray tokens, const char *filename) {
     r.error_line = 0;
     r.error_col = 0;
 
-    Parser p;
+    Parser p = {0};
     p.tokens = tokens;
     p.i = 0;
     p.filename = filename ? filename : "<input>";

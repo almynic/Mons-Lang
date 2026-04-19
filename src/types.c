@@ -29,7 +29,9 @@ typedef enum {
     TY_RESULT,
     TY_ARRAY,
     TY_TUPLE,
-    TY_STRUCT /* named struct; as.st_def holds field names/types for init/checking */
+    TY_STRUCT, /* monomorphic or instantiated generic; as.st_def holds field names/types */
+    TY_GENERIC_STRUCT,
+    TY_GENERIC_FN
 } TyKind;
 
 typedef struct Type {
@@ -38,6 +40,7 @@ typedef struct Type {
         struct {
             int id;
             struct Type *bound;
+            AstList *trait_bounds; /* NODE_IDENT trait names; NULL for plain inference vars */
         } var;
         struct {
             struct Type **params;
@@ -59,6 +62,9 @@ typedef struct Type {
             const char **field_names;
             size_t nfields;
         } st_def;
+        struct {
+            AstNode *decl; /* NODE_STRUCT_DECL or NODE_FN_DECL with generic_params */
+        } g_schema;
     } as;
 } Type;
 
@@ -158,6 +164,7 @@ static Type *new_var(Checker *c) {
     t->kind = TY_VAR;
     t->as.var.id = c->next_var_id++;
     t->as.var.bound = NULL;
+    t->as.var.trait_bounds = NULL;
     return t;
 }
 
@@ -280,6 +287,9 @@ static bool occurs_in(Type *var, Type *t) {
                 }
                 return false;
             }
+        case TY_GENERIC_STRUCT:
+        case TY_GENERIC_FN:
+            return false;
         default:
             return false;
     }
@@ -416,9 +426,403 @@ static void env_free_head(Env *e) {
     e->head = NULL;
 }
 
-static Type *ast_type_to_type(Checker *c, AstNode *n);
+static Type *ast_type_to_type_ex(Checker *c, AstNode *n, Env *tparam_env);
+
+static AstNode *lookup_struct_decl_node_types(AstNode *program, const char *name) {
+    AstList *d;
+    if (!program || program->kind != NODE_PROGRAM || !name) {
+        return NULL;
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_STRUCT_DECL && strcmp(AS_STRUCT_DECL(d->item).name, name) == 0) {
+            return d->item;
+        }
+    }
+    return NULL;
+}
+
+static bool impl_exists_for_struct_trait(AstNode *program, const char *struct_name, const char *trait_name) {
+    AstList *d;
+    if (!program || program->kind != NODE_PROGRAM || !struct_name || !trait_name) {
+        return false;
+    }
+    for (d = AS_PROGRAM(program).decls; d; d = d->next) {
+        if (d->item->kind == NODE_IMPL_DECL && AS_IMPL_DECL(d->item).trait_name &&
+            strcmp(AS_IMPL_DECL(d->item).trait_name, trait_name) == 0 &&
+            strcmp(AS_IMPL_DECL(d->item).struct_name, struct_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool check_subst_satisfies_bounds(Checker *c, Type *concrete, AstList *bounds, SrcLoc loc) {
+    AstList *b;
+    concrete = prune(concrete);
+    if (!bounds) {
+        return true;
+    }
+    if (concrete->kind != TY_STRUCT) {
+        checker_fail(c, loc, "trait bounds apply only when the type argument is a struct");
+        return false;
+    }
+    for (b = bounds; b; b = b->next) {
+        AstNode *bid = b->item;
+        const char *trname;
+        if (!bid || bid->kind != NODE_IDENT) {
+            checker_fail(c, loc, "internal: trait bound");
+            return false;
+        }
+        trname = AS_IDENT(bid).name;
+        if (!impl_exists_for_struct_trait(c->program, concrete->as.st_def.name, trname)) {
+            checker_fail(c, loc, "type argument does not implement required trait");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool append_mangled_type(Checker *c, char *buf, size_t cap, size_t *len, Type *t) {
+    const char *tag;
+    int n;
+    t = prune(t);
+    if (!t) {
+        return false;
+    }
+    switch (t->kind) {
+        case TY_INT:
+            tag = "i";
+            break;
+        case TY_FLOAT:
+            tag = "f";
+            break;
+        case TY_DOUBLE:
+            tag = "d";
+            break;
+        case TY_BOOL:
+            tag = "b";
+            break;
+        case TY_STRING:
+            tag = "s";
+            break;
+        case TY_STRUCT:
+            n = snprintf(buf + *len, cap > *len ? cap - *len : 0, "S%s", t->as.st_def.name);
+            if (n < 0 || (size_t)n >= cap - *len) {
+                checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+                return false;
+            }
+            *len += (size_t)n;
+            return true;
+        case TY_ARRAY:
+            if (*len + 2u >= cap) {
+                checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+                return false;
+            }
+            buf[(*len)++] = 'A';
+            return append_mangled_type(c, buf, cap, len, t->as.inner);
+        case TY_OPTION:
+            if (*len + 2u >= cap) {
+                checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+                return false;
+            }
+            buf[(*len)++] = 'O';
+            return append_mangled_type(c, buf, cap, len, t->as.inner);
+        case TY_TUPLE:
+            {
+                size_t i;
+                if (*len + 2u >= cap) {
+                    checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+                    return false;
+                }
+                buf[(*len)++] = 'T';
+                buf[(*len)++] = '(';
+                for (i = 0; i < t->as.tuple.nelems; i++) {
+                    if (i > 0) {
+                        if (*len + 1u >= cap) {
+                            return false;
+                        }
+                        buf[(*len)++] = ',';
+                    }
+                    if (!append_mangled_type(c, buf, cap, len, t->as.tuple.elems[i])) {
+                        return false;
+                    }
+                }
+                if (*len + 1u >= cap) {
+                    return false;
+                }
+                buf[(*len)++] = ')';
+                return true;
+            }
+        default:
+            checker_fail(c, (SrcLoc){0}, "type not supported in generic mangling yet");
+            return false;
+    }
+    if (*len + 1u >= cap) {
+        return false;
+    }
+    buf[(*len)++] = tag[0];
+    return true;
+}
+
+static char *mangle_generic_struct_name(Checker *c, const char *base, Type **args, size_t narg) {
+    char buf[512];
+    size_t len = 0;
+    size_t i;
+    int w;
+    w = snprintf(buf, sizeof(buf), "%s@", base);
+    if (w < 0 || (size_t)w >= sizeof(buf)) {
+        checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+        return NULL;
+    }
+    len = (size_t)w;
+    for (i = 0; i < narg; i++) {
+        if (i > 0) {
+            if (len + 1u >= sizeof(buf)) {
+                checker_fail(c, (SrcLoc){0}, "type name too long for generic mangling");
+                return NULL;
+            }
+            buf[len++] = ',';
+        }
+        if (!append_mangled_type(c, buf, sizeof(buf), &len, args[i])) {
+            return NULL;
+        }
+    }
+    buf[len] = '\0';
+    {
+        char *cpy = (char *)malloc(len + 1u);
+        if (!cpy) {
+            checker_fail(c, (SrcLoc){0}, "out of memory");
+            return NULL;
+        }
+        memcpy(cpy, buf, len + 1u);
+        return cpy;
+    }
+}
+
+static Type *instantiate_generic_struct_type(Checker *c, AstNode *st_decl, AstList *type_arg_nodes, SrcLoc loc) {
+    AstList *gp;
+    AstList *fl;
+    Type **args;
+    Type **fts;
+    const char **fnames;
+    char *mangled;
+    Type *t;
+    size_t npar;
+    size_t narg;
+    size_t nf;
+    size_t i;
+    Env subst = {0};
+
+    if (!st_decl || st_decl->kind != NODE_STRUCT_DECL || !AS_STRUCT_DECL(st_decl).generic_params) {
+        checker_fail(c, loc, "internal: not a generic struct");
+        return NULL;
+    }
+    npar = ast_list_len(AS_STRUCT_DECL(st_decl).generic_params);
+    narg = ast_list_len(type_arg_nodes);
+    if (npar != narg) {
+        checker_fail(c, loc, "wrong number of type arguments for generic struct");
+        return NULL;
+    }
+    args = (Type **)malloc(npar * sizeof(Type *));
+    if (npar > 0 && !args) {
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    i = 0;
+    for (gp = AS_STRUCT_DECL(st_decl).generic_params; gp; gp = gp->next, i++) {
+        AstNode *gpn = gp->item;
+        AstList *ta;
+        Type *concrete;
+        if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+            env_free_head(&subst);
+            free(args);
+            checker_fail(c, loc, "internal: generic param");
+            return NULL;
+        }
+        ta = type_arg_nodes;
+        {
+            size_t j;
+            for (j = 0; j < i && ta; j++) {
+                ta = ta->next;
+            }
+        }
+        if (!ta || !ta->item) {
+            env_free_head(&subst);
+            free(args);
+            checker_fail(c, loc, "internal: type arg list");
+            return NULL;
+        }
+        concrete = ast_type_to_type_ex(c, ta->item, NULL);
+        if (c->error) {
+            env_free_head(&subst);
+            free(args);
+            return NULL;
+        }
+        if (!check_subst_satisfies_bounds(c, concrete, AS_GENERIC_PARAM(gpn).bounds, loc)) {
+            env_free_head(&subst);
+            free(args);
+            return NULL;
+        }
+        args[i] = concrete;
+        env_insert(&subst, AS_GENERIC_PARAM(gpn).name, concrete);
+    }
+
+    nf = ast_list_len(AS_STRUCT_DECL(st_decl).fields);
+    fts = (Type **)malloc(nf * sizeof(Type *));
+    fnames = (const char **)malloc(nf * sizeof(char *));
+    if (nf > 0 && (!fts || !fnames)) {
+        env_free_head(&subst);
+        free(args);
+        free(fts);
+        free(fnames);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    i = 0;
+    for (fl = AS_STRUCT_DECL(st_decl).fields; fl; fl = fl->next, i++) {
+        AstNode *sf = fl->item;
+        fnames[i] = AS_STRUCT_FIELD(sf).name;
+        fts[i] = ast_type_to_type_ex(c, AS_STRUCT_FIELD(sf).type, &subst);
+        if (c->error) {
+            env_free_head(&subst);
+            free(args);
+            free(fts);
+            free(fnames);
+            return NULL;
+        }
+    }
+
+    mangled = mangle_generic_struct_name(c, AS_STRUCT_DECL(st_decl).name, args, npar);
+    free(args);
+    if (!mangled || c->error) {
+        env_free_head(&subst);
+        free(fts);
+        free(fnames);
+        return NULL;
+    }
+
+    t = alloc_type(c);
+    if (!t) {
+        env_free_head(&subst);
+        free(mangled);
+        free(fts);
+        free(fnames);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    t->kind = TY_STRUCT;
+    t->as.st_def.name = mangled;
+    t->as.st_def.field_types = fts;
+    t->as.st_def.field_names = fnames;
+    t->as.st_def.nfields = nf;
+    env_free_head(&subst);
+    return t;
+}
+
+static Type *instantiate_generic_fn_sig(Checker *c, AstNode *fn_decl, AstList *type_arg_nodes, SrcLoc loc) {
+    AstList *gp;
+    AstList *pl;
+    Type **params;
+    Type *ret;
+    Type *ft;
+    Env subst = {0};
+    size_t npar;
+    size_t narg;
+    size_t i;
+
+    if (!fn_decl || fn_decl->kind != NODE_FN_DECL || !AS_FN_DECL(fn_decl).generic_params) {
+        checker_fail(c, loc, "internal: not a generic function");
+        return NULL;
+    }
+    npar = ast_list_len(AS_FN_DECL(fn_decl).generic_params);
+    narg = ast_list_len(type_arg_nodes);
+    if (npar != narg) {
+        checker_fail(c, loc, "wrong number of type arguments for generic function");
+        return NULL;
+    }
+    i = 0;
+    for (gp = AS_FN_DECL(fn_decl).generic_params; gp; gp = gp->next, i++) {
+        AstNode *gpn = gp->item;
+        AstList *ta;
+        Type *concrete;
+        if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+            env_free_head(&subst);
+            checker_fail(c, loc, "internal: generic param");
+            return NULL;
+        }
+        ta = type_arg_nodes;
+        {
+            size_t j;
+            for (j = 0; j < i && ta; j++) {
+                ta = ta->next;
+            }
+        }
+        if (!ta || !ta->item) {
+            env_free_head(&subst);
+            checker_fail(c, loc, "internal: type arg list");
+            return NULL;
+        }
+        concrete = ast_type_to_type_ex(c, ta->item, NULL);
+        if (c->error) {
+            env_free_head(&subst);
+            return NULL;
+        }
+        if (!check_subst_satisfies_bounds(c, concrete, AS_GENERIC_PARAM(gpn).bounds, loc)) {
+            env_free_head(&subst);
+            return NULL;
+        }
+        env_insert(&subst, AS_GENERIC_PARAM(gpn).name, concrete);
+    }
+
+    narg = ast_list_len(AS_FN_DECL(fn_decl).params);
+    params = (Type **)malloc(narg * sizeof(Type *));
+    if (narg > 0 && !params) {
+        env_free_head(&subst);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    i = 0;
+    for (pl = AS_FN_DECL(fn_decl).params; pl; pl = pl->next, i++) {
+        AstNode *param = pl->item;
+        if (!AS_PARAM(param).type) {
+            env_free_head(&subst);
+            free(params);
+            checker_fail(c, param->loc, "parameter type required");
+            return NULL;
+        }
+        params[i] = ast_type_to_type_ex(c, AS_PARAM(param).type, &subst);
+        if (c->error) {
+            env_free_head(&subst);
+            free(params);
+            return NULL;
+        }
+    }
+    if (AS_FN_DECL(fn_decl).ret_type) {
+        ret = ast_type_to_type_ex(c, AS_FN_DECL(fn_decl).ret_type, &subst);
+    } else {
+        ret = new_var(c);
+    }
+    if (c->error) {
+        env_free_head(&subst);
+        free(params);
+        return NULL;
+    }
+    ft = new_fn_type(c, params, narg, ret);
+    if (!ft) {
+        env_free_head(&subst);
+        free(params);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    env_free_head(&subst);
+    return ft;
+}
 
 static Type *ast_type_to_type(Checker *c, AstNode *n) {
+    return ast_type_to_type_ex(c, n, NULL);
+}
+
+static Type *ast_type_to_type_ex(Checker *c, AstNode *n, Env *tparam_env) {
     if (!n) {
         return ty_void;
     }
@@ -436,7 +840,7 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
             }
         case NODE_TYPE_ARRAY:
             {
-                Type *el = ast_type_to_type(c, AS_TYPE_ARRAY(n).elem_type);
+                Type *el = ast_type_to_type_ex(c, AS_TYPE_ARRAY(n).elem_type, tparam_env);
                 if (c->error) {
                     return NULL;
                 }
@@ -444,7 +848,7 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
             }
         case NODE_TYPE_OPTION:
             {
-                Type *in = ast_type_to_type(c, AS_TYPE_OPTION(n).inner);
+                Type *in = ast_type_to_type_ex(c, AS_TYPE_OPTION(n).inner, tparam_env);
                 if (c->error) {
                     return NULL;
                 }
@@ -452,8 +856,8 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
             }
         case NODE_TYPE_RESULT:
             {
-                Type *ok = ast_type_to_type(c, AS_TYPE_RESULT(n).ok_type);
-                Type *err = ast_type_to_type(c, AS_TYPE_RESULT(n).err_type);
+                Type *ok = ast_type_to_type_ex(c, AS_TYPE_RESULT(n).ok_type, tparam_env);
+                Type *err = ast_type_to_type_ex(c, AS_TYPE_RESULT(n).err_type, tparam_env);
                 if (c->error) {
                     return NULL;
                 }
@@ -463,6 +867,14 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
             {
                 const char *nm = AS_TYPE_NAMED(n).name;
                 Type *got;
+
+                if (tparam_env) {
+                    got = env_lookup(tparam_env, nm);
+                    if (got) {
+                        return got;
+                    }
+                }
+
                 if (strcmp(nm, "Option") == 0) {
                     checker_fail(c, n->loc, "Option requires type arguments");
                     return NULL;
@@ -471,9 +883,47 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
                     checker_fail(c, n->loc, "Result requires type arguments");
                     return NULL;
                 }
+
                 got = env_lookup(c->global_env, nm);
-                if (!got || prune(got)->kind != TY_STRUCT) {
+                if (!got) {
+                    checker_fail(c, n->loc, "unknown type");
+                    return NULL;
+                }
+                got = prune(got);
+
+                if (AS_TYPE_NAMED(n).type_args) {
+                    if (got->kind == TY_GENERIC_STRUCT) {
+                        return instantiate_generic_struct_type(c, got->as.g_schema.decl, AS_TYPE_NAMED(n).type_args,
+                                                               n->loc);
+                    }
+                    checker_fail(c, n->loc, "type arguments not allowed for this type");
+                    return NULL;
+                }
+                if (got->kind == TY_GENERIC_STRUCT) {
+                    checker_fail(c, n->loc, "generic struct requires type arguments");
+                    return NULL;
+                }
+                if (got->kind == TY_GENERIC_FN) {
+                    checker_fail(c, n->loc, "function type cannot be used as a struct");
+                    return NULL;
+                }
+                if (got->kind != TY_STRUCT) {
                     checker_fail(c, n->loc, "unknown struct type");
+                    return NULL;
+                }
+                return got;
+            }
+        case NODE_TYPE_SELF:
+            {
+                Type *got;
+
+                if (!tparam_env) {
+                    checker_fail(c, n->loc, "`Self` is only valid in trait method signatures");
+                    return NULL;
+                }
+                got = env_lookup(tparam_env, "Self");
+                if (!got) {
+                    checker_fail(c, n->loc, "`Self` not bound (internal)");
                     return NULL;
                 }
                 return got;
@@ -488,7 +938,7 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
                 }
                 size_t i = 0;
                 for (l = AS_TYPE_TUPLE(n).elem_types; l; l = l->next) {
-                    buf[i++] = ast_type_to_type(c, l->item);
+                    buf[i++] = ast_type_to_type_ex(c, l->item, tparam_env);
                     if (c->error) {
                         free(buf);
                         return NULL;
@@ -506,13 +956,13 @@ static Type *ast_type_to_type(Checker *c, AstNode *n) {
                 }
                 size_t i = 0;
                 for (pl = AS_TYPE_FN(n).param_types; pl; pl = pl->next) {
-                    params[i++] = ast_type_to_type(c, pl->item);
+                    params[i++] = ast_type_to_type_ex(c, pl->item, tparam_env);
                     if (c->error) {
                         free(params);
                         return NULL;
                     }
                 }
-                Type *ret = ast_type_to_type(c, AS_TYPE_FN(n).ret_type);
+                Type *ret = ast_type_to_type_ex(c, AS_TYPE_FN(n).ret_type, tparam_env);
                 if (c->error) {
                     free(params);
                     return NULL;
@@ -586,6 +1036,10 @@ static AstNode *type_to_ast_type(Checker *c, Type *t, SrcLoc loc) {
             return NULL;
         case TY_VAR:
             checker_fail(c, loc, "could not fully infer type (add annotations)");
+            return NULL;
+        case TY_GENERIC_STRUCT:
+        case TY_GENERIC_FN:
+            checker_fail(c, loc, "internal: generic schema in type materialization");
             return NULL;
         case TY_STRUCT: {
             AstNode *n = ast_alloc(NODE_TYPE_NAMED, loc);
@@ -1201,6 +1655,71 @@ static Type *struct_field_type(Type *st, const char *fname, size_t *out_index) {
     return NULL;
 }
 
+/* `t.field` when `t` is `T` with trait bounds: every struct that implements *all* bounds must
+ * define `field`, and field types must unify. */
+static Type *bounded_typevar_field_type(Checker *c, Type *obj_t, const char *fname, SrcLoc loc) {
+    AstList *d;
+    AstList *b;
+    Type *acc = NULL;
+
+    obj_t = prune(obj_t);
+    if (!obj_t || obj_t->kind != TY_VAR || !obj_t->as.var.trait_bounds || !fname) {
+        return NULL;
+    }
+    for (d = AS_PROGRAM(c->program).decls; d; d = d->next) {
+        const char *sname;
+        Type *st;
+        Type *ft;
+        bool ok;
+
+        if (d->item->kind != NODE_STRUCT_DECL) {
+            continue;
+        }
+        sname = AS_STRUCT_DECL(d->item).name;
+        ok = true;
+        for (b = obj_t->as.var.trait_bounds; b; b = b->next) {
+            AstNode *tid = b->item;
+            if (!tid || tid->kind != NODE_IDENT) {
+                ok = false;
+                break;
+            }
+            if (!impl_exists_for_struct_trait(c->program, sname, AS_IDENT(tid).name)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        st = env_lookup(c->global_env, sname);
+        if (!st) {
+            continue;
+        }
+        st = prune(st);
+        if (st->kind != TY_STRUCT) {
+            continue;
+        }
+        ft = struct_field_type(st, fname, NULL);
+        if (!ft) {
+            checker_fail(c, loc,
+                         "field access on bounded type parameter: field not present on every struct "
+                         "that implements the bounds");
+            return NULL;
+        }
+        if (!acc) {
+            acc = ft;
+        } else if (!unify(c, acc, ft, loc)) {
+            return NULL;
+        }
+    }
+    if (!acc) {
+        checker_fail(c, loc,
+                     "field access on bounded type parameter: no struct implements all required traits");
+        return NULL;
+    }
+    return acc;
+}
+
 static AstNode *lookup_trait_decl(AstNode *program, const char *trait_name) {
     AstList *d;
     if (!program || program->kind != NODE_PROGRAM || !trait_name) {
@@ -1228,6 +1747,105 @@ static AstNode *find_trait_fn_sig(AstNode *trait_decl, const char *method_name) 
     return NULL;
 }
 
+/* Compare trait type syntax to impl type syntax; `Self` in the trait side matches `impl_struct` on the impl side. */
+static bool type_ast_equal_sub_self(const AstNode *trait_ty, const AstNode *impl_ty, const char *impl_struct) {
+    if (!trait_ty && !impl_ty) {
+        return true;
+    }
+    if (!trait_ty || !impl_ty) {
+        return false;
+    }
+    if (trait_ty->kind == NODE_TYPE_SELF && impl_ty->kind == NODE_TYPE_SELF) {
+        return true;
+    }
+    if (trait_ty->kind == NODE_TYPE_SELF) {
+        if (!impl_struct || impl_ty->kind != NODE_TYPE_NAMED) {
+            return false;
+        }
+        return strcmp(AS_TYPE_NAMED(impl_ty).name, impl_struct) == 0;
+    }
+    if (trait_ty->kind != impl_ty->kind) {
+        return false;
+    }
+    switch (trait_ty->kind) {
+        case NODE_TYPE_PRIMITIVE:
+            return AS_TYPE_PRIM(trait_ty).prim == AS_TYPE_PRIM(impl_ty).prim;
+        case NODE_TYPE_NAMED:
+            {
+                AstList *la;
+                AstList *lb;
+                if (strcmp(AS_TYPE_NAMED(trait_ty).name, AS_TYPE_NAMED(impl_ty).name) != 0) {
+                    return false;
+                }
+                la = AS_TYPE_NAMED(trait_ty).type_args;
+                lb = AS_TYPE_NAMED(impl_ty).type_args;
+                for (; la && lb; la = la->next, lb = lb->next) {
+                    if (!type_ast_equal_sub_self(la->item, lb->item, impl_struct)) {
+                        return false;
+                    }
+                }
+                return la == NULL && lb == NULL;
+            }
+        case NODE_TYPE_ARRAY:
+            return type_ast_equal_sub_self(AS_TYPE_ARRAY(trait_ty).elem_type, AS_TYPE_ARRAY(impl_ty).elem_type,
+                                           impl_struct);
+        case NODE_TYPE_OPTION:
+            return type_ast_equal_sub_self(AS_TYPE_OPTION(trait_ty).inner, AS_TYPE_OPTION(impl_ty).inner,
+                                           impl_struct);
+        case NODE_TYPE_RESULT:
+            return type_ast_equal_sub_self(AS_TYPE_RESULT(trait_ty).ok_type, AS_TYPE_RESULT(impl_ty).ok_type,
+                                           impl_struct) &&
+                   type_ast_equal_sub_self(AS_TYPE_RESULT(trait_ty).err_type, AS_TYPE_RESULT(impl_ty).err_type,
+                                           impl_struct);
+        case NODE_TYPE_REF:
+            return AS_TYPE_REF(trait_ty).is_mut == AS_TYPE_REF(impl_ty).is_mut &&
+                   type_ast_equal_sub_self(AS_TYPE_REF(trait_ty).inner, AS_TYPE_REF(impl_ty).inner, impl_struct);
+        case NODE_TYPE_TUPLE:
+            {
+                AstList *la = AS_TYPE_TUPLE(trait_ty).elem_types;
+                AstList *lb = AS_TYPE_TUPLE(impl_ty).elem_types;
+                for (; la && lb; la = la->next, lb = lb->next) {
+                    if (!type_ast_equal_sub_self(la->item, lb->item, impl_struct)) {
+                        return false;
+                    }
+                }
+                return la == NULL && lb == NULL;
+            }
+        case NODE_TYPE_FN:
+            {
+                AstList *la = AS_TYPE_FN(trait_ty).param_types;
+                AstList *lb = AS_TYPE_FN(impl_ty).param_types;
+                for (; la && lb; la = la->next, lb = lb->next) {
+                    if (!type_ast_equal_sub_self(la->item, lb->item, impl_struct)) {
+                        return false;
+                    }
+                }
+                if (la != NULL || lb != NULL) {
+                    return false;
+                }
+                return type_ast_equal_sub_self(AS_TYPE_FN(trait_ty).ret_type, AS_TYPE_FN(impl_ty).ret_type,
+                                               impl_struct);
+            }
+        default:
+            return false;
+    }
+}
+
+static const char *impl_fn_self_struct_type_name(AstNode *fn) {
+    AstNode *p0;
+    if (!fn || fn->kind != NODE_FN_DECL || !AS_FN_DECL(fn).params || !AS_FN_DECL(fn).params->item) {
+        return NULL;
+    }
+    p0 = AS_FN_DECL(fn).params->item;
+    if (strcmp(AS_PARAM(p0).name, "self") != 0 || !AS_PARAM(p0).type) {
+        return NULL;
+    }
+    if (AS_PARAM(p0).type->kind != NODE_TYPE_NAMED) {
+        return NULL;
+    }
+    return AS_TYPE_NAMED(AS_PARAM(p0).type).name;
+}
+
 static bool type_ast_equal(const AstNode *a, const AstNode *b) {
     if (!a && !b) {
         return true;
@@ -1239,10 +1857,26 @@ static bool type_ast_equal(const AstNode *a, const AstNode *b) {
         return false;
     }
     switch (a->kind) {
+        case NODE_TYPE_SELF:
+            return true;
         case NODE_TYPE_PRIMITIVE:
             return AS_TYPE_PRIM(a).prim == AS_TYPE_PRIM(b).prim;
         case NODE_TYPE_NAMED:
-            return strcmp(AS_TYPE_NAMED(a).name, AS_TYPE_NAMED(b).name) == 0;
+            {
+                AstList *la;
+                AstList *lb;
+                if (strcmp(AS_TYPE_NAMED(a).name, AS_TYPE_NAMED(b).name) != 0) {
+                    return false;
+                }
+                la = AS_TYPE_NAMED(a).type_args;
+                lb = AS_TYPE_NAMED(b).type_args;
+                for (; la && lb; la = la->next, lb = lb->next) {
+                    if (!type_ast_equal(la->item, lb->item)) {
+                        return false;
+                    }
+                }
+                return la == NULL && lb == NULL;
+            }
         case NODE_TYPE_ARRAY:
             return type_ast_equal(AS_TYPE_ARRAY(a).elem_type, AS_TYPE_ARRAY(b).elem_type);
         case NODE_TYPE_OPTION:
@@ -1269,7 +1903,12 @@ static bool type_ast_equal(const AstNode *a, const AstNode *b) {
 static bool trait_sig_matches_impl_fn(AstNode *sig, AstNode *fn) {
     AstList *ps;
     AstList *pf;
+    const char *impl_st;
     if (!sig || sig->kind != NODE_TRAIT_FN_SIG || !fn || fn->kind != NODE_FN_DECL) {
+        return false;
+    }
+    impl_st = impl_fn_self_struct_type_name(fn);
+    if (!impl_st) {
         return false;
     }
     if (ast_list_len(AS_TRAIT_FN_SIG(sig).params) != ast_list_len(AS_FN_DECL(fn).params)) {
@@ -1285,11 +1924,11 @@ static bool trait_sig_matches_impl_fn(AstNode *sig, AstNode *fn) {
         if (strcmp(AS_PARAM(sp).name, AS_PARAM(fp).name) != 0) {
             return false;
         }
-        if (!type_ast_equal(AS_PARAM(sp).type, AS_PARAM(fp).type)) {
+        if (!type_ast_equal_sub_self(AS_PARAM(sp).type, AS_PARAM(fp).type, impl_st)) {
             return false;
         }
     }
-    return type_ast_equal(AS_TRAIT_FN_SIG(sig).ret_type, AS_FN_DECL(fn).ret_type);
+    return type_ast_equal_sub_self(AS_TRAIT_FN_SIG(sig).ret_type, AS_FN_DECL(fn).ret_type, impl_st);
 }
 
 static bool method_receiver_struct_matches(Type *recv_st, AstNode *fn) {
@@ -1339,6 +1978,156 @@ static AstNode *lookup_fn_decl_for_method(Checker *c, const char *method_name, T
         }
     }
     return NULL;
+}
+
+/* Bounded type parameter: find a trait item that declares `method_name` (same trait may repeat in bounds). */
+static AstNode *find_trait_method_sig_for_typevar(Checker *c, AstList *trait_bounds, const char *method_name,
+                                                  SrcLoc loc) {
+    AstList *b;
+    AstNode *first_sig = NULL;
+    AstNode *first_trait = NULL;
+
+    if (!trait_bounds || !method_name) {
+        return NULL;
+    }
+    for (b = trait_bounds; b; b = b->next) {
+        AstNode *tid = b->item;
+        AstNode *tdecl;
+        AstNode *sig;
+        if (!tid || tid->kind != NODE_IDENT) {
+            continue;
+        }
+        tdecl = lookup_trait_decl(c->program, AS_IDENT(tid).name);
+        if (!tdecl) {
+            continue;
+        }
+        sig = find_trait_fn_sig(tdecl, method_name);
+        if (!sig) {
+            continue;
+        }
+        if (first_sig == NULL) {
+            first_sig = sig;
+            first_trait = tdecl;
+        } else if (first_trait != tdecl) {
+            checker_fail(c, loc,
+                         "ambiguous method on type parameter: multiple traits declare this method");
+            return NULL;
+        }
+    }
+    (void)first_trait;
+    return first_sig;
+}
+
+/* Instantiate trait method types by replacing the trait self struct name with recv_subst (the type var T). */
+static Type *fn_type_from_trait_method_sig(Checker *c, AstNode *sig, Type *recv_subst, SrcLoc loc) {
+    AstList *pl;
+    Env subst = {0};
+    Type **params;
+    size_t n;
+    size_t j;
+    Type *ret;
+    Type *ft;
+    AstNode *p0;
+
+    if (!sig || sig->kind != NODE_TRAIT_FN_SIG || !recv_subst) {
+        checker_fail(c, loc, "internal: trait method type");
+        return NULL;
+    }
+    if (!AS_TRAIT_FN_SIG(sig).params || !AS_TRAIT_FN_SIG(sig).params->item) {
+        checker_fail(c, loc, "internal: trait method params");
+        return NULL;
+    }
+    p0 = AS_TRAIT_FN_SIG(sig).params->item;
+    if (!p0 || p0->kind != NODE_PARAM || !AS_PARAM(p0).type) {
+        checker_fail(c, loc, "internal: trait method self parameter");
+        return NULL;
+    }
+    if (AS_PARAM(p0).type->kind == NODE_TYPE_SELF) {
+        env_insert(&subst, "Self", recv_subst);
+    } else if (AS_PARAM(p0).type->kind == NODE_TYPE_NAMED) {
+        const char *selfnm = AS_TYPE_NAMED(AS_PARAM(p0).type).name;
+        env_insert(&subst, selfnm, recv_subst);
+    } else {
+        checker_fail(c, loc, "trait method self type must be `Self` or a named struct type");
+        return NULL;
+    }
+
+    n = ast_list_len(AS_TRAIT_FN_SIG(sig).params);
+    params = (Type **)malloc(n * sizeof(Type *));
+    if (n > 0 && !params) {
+        env_free_head(&subst);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    j = 0;
+    for (pl = AS_TRAIT_FN_SIG(sig).params; pl; pl = pl->next, j++) {
+        AstNode *param = pl->item;
+        if (!AS_PARAM(param).type) {
+            env_free_head(&subst);
+            free(params);
+            checker_fail(c, loc, "trait method parameter needs a type");
+            return NULL;
+        }
+        params[j] = ast_type_to_type_ex(c, AS_PARAM(param).type, &subst);
+        if (c->error) {
+            env_free_head(&subst);
+            free(params);
+            return NULL;
+        }
+    }
+    ret = ast_type_to_type_ex(c, AS_TRAIT_FN_SIG(sig).ret_type, &subst);
+    env_free_head(&subst);
+    if (c->error) {
+        free(params);
+        return NULL;
+    }
+    ft = new_fn_type(c, params, n, ret);
+    if (!ft) {
+        free(params);
+        checker_fail(c, loc, "out of memory");
+        return NULL;
+    }
+    return ft;
+}
+
+static bool verify_resolved_generic_params(Checker *c, AstNode *fn, Type **rigid_vars, size_t ngp) {
+    AstList *gp;
+    size_t i;
+
+    if (!fn || fn->kind != NODE_FN_DECL) {
+        return false;
+    }
+    for (gp = AS_FN_DECL(fn).generic_params, i = 0; gp && i < ngp; gp = gp->next, i++) {
+        AstNode *gpn = gp->item;
+        Type *pt;
+
+        if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+            checker_fail(c, fn->loc, "internal: generic parameter");
+            return false;
+        }
+        pt = prune(rigid_vars[i]);
+        if (!pt) {
+            checker_fail(c, fn->loc, "internal: generic type parameter");
+            return false;
+        }
+        if (pt->kind == TY_VAR) {
+            /* Still abstract after body: ok for `T: Trait` (witnesses checked at `f::<U>(...)`). */
+            if (pt->as.var.trait_bounds) {
+                continue;
+            }
+            /* Unconstrained `T` may stay a var if the parameter is unused in the body. */
+            if (!AS_GENERIC_PARAM(gpn).bounds) {
+                continue;
+            }
+            checker_fail(c, fn->loc, "type parameter could not be fully determined (add annotations or uses)");
+            return false;
+        }
+        if (AS_GENERIC_PARAM(gpn).bounds &&
+            !check_subst_satisfies_bounds(c, pt, AS_GENERIC_PARAM(gpn).bounds, gpn->loc)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void assign_bc_tag(AstNode *n, Type *t) {
@@ -1491,48 +2280,136 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
             }
         case NODE_CALL:
             {
-                Type *callee_t = infer_expr(c, AS_CALL(n).callee);
-                if (c->error) {
-                    return NULL;
-                }
-                callee_t = prune(callee_t);
-                if (callee_t->kind != TY_FN) {
-                    checker_fail(c, n->loc, "call target is not a function");
-                    return NULL;
-                }
-                AstList *arg;
-                size_t i = 0;
-                for (arg = AS_CALL(n).args; arg; arg = arg->next, i++) {
-                    if (i >= callee_t->as.fn.nparams) {
-                        checker_fail(c, n->loc, "too many arguments");
+                AstNode *cal = AS_CALL(n).callee;
+                if (cal && cal->kind == NODE_IDENT && AS_CALL(n).type_args) {
+                    Type *gt = env_lookup(c->global_env, AS_IDENT(cal).name);
+                    gt = gt ? prune(gt) : NULL;
+                    if (gt && gt->kind == TY_GENERIC_FN) {
+                        Type *cft = instantiate_generic_fn_sig(c, gt->as.g_schema.decl, AS_CALL(n).type_args, n->loc);
+                        AstList *arg;
+                        size_t i = 0;
+                        if (c->error || !cft) {
+                            return NULL;
+                        }
+                        for (arg = AS_CALL(n).args; arg; arg = arg->next, i++) {
+                            if (i >= cft->as.fn.nparams) {
+                                checker_fail(c, n->loc, "too many arguments");
+                                return NULL;
+                            }
+                            {
+                                Type *at = infer_expr(c, arg->item);
+                                if (c->error) {
+                                    return NULL;
+                                }
+                                if (!unify(c, at, cft->as.fn.params[i], arg->item->loc)) {
+                                    return NULL;
+                                }
+                            }
+                        }
+                        if (i != cft->as.fn.nparams) {
+                            checker_fail(c, n->loc, "too few arguments");
+                            return NULL;
+                        }
+                        return cft->as.fn.ret;
+                    }
+                    if (gt && gt->kind != TY_GENERIC_FN) {
+                        checker_fail(c, n->loc, "type arguments only apply to generic functions");
                         return NULL;
                     }
-                    Type *at = infer_expr(c, arg->item);
+                }
+
+                {
+                    Type *callee_t = infer_expr(c, cal);
                     if (c->error) {
                         return NULL;
                     }
-                    if (!unify(c, at, callee_t->as.fn.params[i], arg->item->loc)) {
+                    callee_t = prune(callee_t);
+                    if (callee_t->kind == TY_GENERIC_FN) {
+                        checker_fail(c, n->loc, "generic function requires explicit type arguments (name::<T>(...))");
                         return NULL;
                     }
+                    if (callee_t->kind != TY_FN) {
+                        checker_fail(c, n->loc, "call target is not a function");
+                        return NULL;
+                    }
+                    {
+                        AstList *arg;
+                        size_t i = 0;
+                        for (arg = AS_CALL(n).args; arg; arg = arg->next, i++) {
+                            if (i >= callee_t->as.fn.nparams) {
+                                checker_fail(c, n->loc, "too many arguments");
+                                return NULL;
+                            }
+                            {
+                                Type *at = infer_expr(c, arg->item);
+                                if (c->error) {
+                                    return NULL;
+                                }
+                                if (!unify(c, at, callee_t->as.fn.params[i], arg->item->loc)) {
+                                    return NULL;
+                                }
+                            }
+                        }
+                        if (i != callee_t->as.fn.nparams) {
+                            checker_fail(c, n->loc, "too few arguments");
+                            return NULL;
+                        }
+                        return callee_t->as.fn.ret;
+                    }
                 }
-                if (i != callee_t->as.fn.nparams) {
-                    checker_fail(c, n->loc, "too few arguments");
-                    return NULL;
-                }
-                return callee_t->as.fn.ret;
             }
         /* Same as eval: top-level fn named `method`, first param must be `self` = receiver type. */
         case NODE_METHOD_CALL:
             {
                 Type *recv_t = infer_expr(c, AS_METHOD_CALL(n).receiver);
+                Type *recv_p;
                 AstNode *fn_ast;
                 Type *ft;
                 AstList *arg;
                 size_t j;
                 size_t nargs;
+                AstNode *trait_sig;
+
                 if (c->error) {
                     return NULL;
                 }
+                recv_p = prune(recv_t);
+                if (recv_p->kind == TY_VAR && recv_p->as.var.trait_bounds) {
+                    trait_sig = find_trait_method_sig_for_typevar(c, recv_p->as.var.trait_bounds, AS_METHOD_CALL(n).method,
+                                                                  n->loc);
+                    if (c->error) {
+                        return NULL;
+                    }
+                    if (!trait_sig) {
+                        checker_fail(c, n->loc, "unknown method for bounded type parameter");
+                        return NULL;
+                    }
+                    ft = fn_type_from_trait_method_sig(c, trait_sig, recv_p, n->loc);
+                    if (c->error || !ft) {
+                        return NULL;
+                    }
+                    if (!unify(c, recv_t, ft->as.fn.params[0], AS_METHOD_CALL(n).receiver->loc)) {
+                        return NULL;
+                    }
+                    nargs = ast_list_len(AS_METHOD_CALL(n).args);
+                    if (nargs + 1 != ft->as.fn.nparams) {
+                        checker_fail(c, n->loc, "wrong argument count in method call");
+                        return NULL;
+                    }
+                    j = 0;
+                    for (arg = AS_METHOD_CALL(n).args; arg; arg = arg->next, j++) {
+                        Type *at = infer_expr(c, arg->item);
+                        if (c->error) {
+                            return NULL;
+                        }
+                        if (!unify(c, at, ft->as.fn.params[j + 1], arg->item->loc)) {
+                            return NULL;
+                        }
+                    }
+                    AS_METHOD_CALL(n).resolved_fn = NULL;
+                    return ft->as.fn.ret;
+                }
+
                 fn_ast = lookup_fn_decl_for_method(c, AS_METHOD_CALL(n).method, recv_t);
                 if (!fn_ast) {
                     checker_fail(c, n->loc, "unknown method");
@@ -1582,8 +2459,13 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
                 }
                 obj_t = prune(obj_t);
                 ft = struct_field_type(obj_t, AS_FIELD_ACCESS(n).field, NULL);
+                if (!ft && obj_t->kind == TY_VAR && obj_t->as.var.trait_bounds) {
+                    ft = bounded_typevar_field_type(c, obj_t, AS_FIELD_ACCESS(n).field, n->loc);
+                }
                 if (!ft) {
-                    checker_fail(c, n->loc, "unknown field or not a struct value");
+                    if (!c->error) {
+                        checker_fail(c, n->loc, "unknown field or not a struct value");
+                    }
                     return NULL;
                 }
                 return ft;
@@ -1668,13 +2550,34 @@ static Type *infer_expr_impl(Checker *c, AstNode *n) {
             {
                 const char *sname = AS_STRUCT_INIT(n).struct_name;
                 Type *st_t = env_lookup(c->global_env, sname);
+                AstNode *decl;
                 AstList *fi;
                 bool *seen;
                 size_t i;
                 size_t nf;
                 st_t = st_t ? prune(st_t) : NULL;
-                if (!st_t || st_t->kind != TY_STRUCT) {
+                decl = lookup_struct_decl_node_types(c->program, sname);
+                if (!decl) {
                     checker_fail(c, n->loc, "unknown struct type in initializer");
+                    return NULL;
+                }
+                if (AS_STRUCT_INIT(n).type_args) {
+                    if (!AS_STRUCT_DECL(decl).generic_params) {
+                        checker_fail(c, n->loc, "type arguments not allowed for non-generic struct");
+                        return NULL;
+                    }
+                    st_t = instantiate_generic_struct_type(c, decl, AS_STRUCT_INIT(n).type_args, n->loc);
+                } else {
+                    if (AS_STRUCT_DECL(decl).generic_params) {
+                        checker_fail(c, n->loc, "generic struct initializer requires type arguments (Type::<T> { ... })");
+                        return NULL;
+                    }
+                    if (!st_t || st_t->kind != TY_STRUCT) {
+                        checker_fail(c, n->loc, "unknown struct type in initializer");
+                        return NULL;
+                    }
+                }
+                if (c->error || !st_t || st_t->kind != TY_STRUCT) {
                     return NULL;
                 }
                 nf = st_t->as.st_def.nfields;
@@ -2070,11 +2973,65 @@ static Type *infer_block(Checker *c, AstNode *block_node) {
 
 static bool register_fn_sig(Checker *c, AstNode *fn) {
     AstList *pl;
+    AstList *gp;
     size_t n;
+    Type *gty;
     if (env_lookup(c->global_env, AS_FN_DECL(fn).name)) {
         checker_fail(c, fn->loc, "duplicate function or type name");
         return false;
     }
+
+    if (AS_FN_DECL(fn).generic_params) {
+        Env tenv = {0};
+        for (gp = AS_FN_DECL(fn).generic_params; gp; gp = gp->next) {
+            AstNode *gpn = gp->item;
+            Type *tv;
+            if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+                env_free_head(&tenv);
+                checker_fail(c, fn->loc, "internal: generic parameter");
+                return false;
+            }
+            tv = new_var(c);
+            if (!tv) {
+                env_free_head(&tenv);
+                checker_fail(c, fn->loc, "out of memory");
+                return false;
+            }
+            env_insert(&tenv, AS_GENERIC_PARAM(gpn).name, tv);
+        }
+        for (pl = AS_FN_DECL(fn).params; pl; pl = pl->next) {
+            AstNode *param = pl->item;
+            if (!AS_PARAM(param).type) {
+                env_free_head(&tenv);
+                checker_fail(c, param->loc, "parameter type required");
+                return false;
+            }
+            (void)ast_type_to_type_ex(c, AS_PARAM(param).type, &tenv);
+            if (c->error) {
+                env_free_head(&tenv);
+                return false;
+            }
+        }
+        if (AS_FN_DECL(fn).ret_type) {
+            (void)ast_type_to_type_ex(c, AS_FN_DECL(fn).ret_type, &tenv);
+            if (c->error) {
+                env_free_head(&tenv);
+                return false;
+            }
+        }
+        env_free_head(&tenv);
+
+        gty = alloc_type(c);
+        if (!gty) {
+            checker_fail(c, fn->loc, "out of memory");
+            return false;
+        }
+        gty->kind = TY_GENERIC_FN;
+        gty->as.g_schema.decl = fn;
+        env_insert(c->global_env, AS_FN_DECL(fn).name, gty);
+        return true;
+    }
+
     n = ast_list_len(AS_FN_DECL(fn).params);
     Type **params = (Type **)malloc(n * sizeof(Type *));
     if (!params && n > 0) {
@@ -2273,9 +3230,150 @@ static bool register_const(Checker *c, AstNode *cd) {
     return true;
 }
 
+/* Type-check generic function body with rigid type variables per type parameter. */
+static bool check_generic_fn_body(Checker *c, AstNode *fn) {
+    Env tparam = {0};
+    AstList *gp;
+    AstList *pl;
+    Type **params;
+    Type *ret;
+    Type *ft;
+    Type **rigid_vars;
+    size_t ngp;
+    size_t n;
+    size_t i;
+
+    ngp = ast_list_len(AS_FN_DECL(fn).generic_params);
+    rigid_vars = (Type **)calloc(ngp, sizeof(Type *));
+    if (ngp > 0 && !rigid_vars) {
+        checker_fail(c, fn->loc, "out of memory");
+        return false;
+    }
+
+    for (gp = AS_FN_DECL(fn).generic_params, i = 0; gp; gp = gp->next, i++) {
+        AstNode *gpn = gp->item;
+        Type *v;
+        if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+            env_free_head(&tparam);
+            free(rigid_vars);
+            checker_fail(c, fn->loc, "internal: generic parameter");
+            return false;
+        }
+        v = new_var(c);
+        if (!v) {
+            env_free_head(&tparam);
+            free(rigid_vars);
+            checker_fail(c, fn->loc, "out of memory");
+            return false;
+        }
+        v->as.var.trait_bounds = AS_GENERIC_PARAM(gpn).bounds;
+        rigid_vars[i] = v;
+        env_insert(&tparam, AS_GENERIC_PARAM(gpn).name, v);
+    }
+
+    n = ast_list_len(AS_FN_DECL(fn).params);
+    params = (Type **)malloc(n * sizeof(Type *));
+    if (n > 0 && !params) {
+        env_free_head(&tparam);
+        free(rigid_vars);
+        checker_fail(c, fn->loc, "out of memory");
+        return false;
+    }
+    i = 0;
+    for (pl = AS_FN_DECL(fn).params; pl; pl = pl->next, i++) {
+        AstNode *param = pl->item;
+        if (!AS_PARAM(param).type) {
+            env_free_head(&tparam);
+            free(params);
+            free(rigid_vars);
+            checker_fail(c, param->loc, "parameter type required");
+            return false;
+        }
+        params[i] = ast_type_to_type_ex(c, AS_PARAM(param).type, &tparam);
+        if (c->error) {
+            env_free_head(&tparam);
+            free(params);
+            free(rigid_vars);
+            return false;
+        }
+    }
+    if (AS_FN_DECL(fn).ret_type) {
+        ret = ast_type_to_type_ex(c, AS_FN_DECL(fn).ret_type, &tparam);
+    } else {
+        ret = new_var(c);
+    }
+    env_free_head(&tparam);
+    if (c->error) {
+        free(params);
+        free(rigid_vars);
+        return false;
+    }
+
+    ft = new_fn_type(c, params, n, ret);
+    if (!ft) {
+        free(params);
+        free(rigid_vars);
+        checker_fail(c, fn->loc, "out of memory");
+        return false;
+    }
+
+    {
+        Env fn_env = { .head = NULL, .parent = c->global_env };
+        for (pl = AS_FN_DECL(fn).params, i = 0; pl; pl = pl->next, i++) {
+            env_insert(&fn_env, AS_PARAM(pl->item).name, ft->as.fn.params[i]);
+        }
+
+        c->current_env = &fn_env;
+        c->expected_return = ft->as.fn.ret;
+
+        {
+            Type *body_ty = infer_block(c, AS_FN_DECL(fn).body);
+            if (c->error) {
+                env_free_head(&fn_env);
+                c->current_env = c->global_env;
+                c->expected_return = NULL;
+                free(rigid_vars);
+                return false;
+            }
+            if (!body_ty) {
+                env_free_head(&fn_env);
+                c->current_env = c->global_env;
+                c->expected_return = NULL;
+                free(rigid_vars);
+                checker_fail(c, AS_FN_DECL(fn).body->loc, "could not infer block type");
+                return false;
+            }
+            if (!unify(c, body_ty, ft->as.fn.ret, AS_FN_DECL(fn).body->loc)) {
+                env_free_head(&fn_env);
+                c->current_env = c->global_env;
+                c->expected_return = NULL;
+                free(rigid_vars);
+                return false;
+            }
+        }
+
+        env_free_head(&fn_env);
+        c->current_env = c->global_env;
+        c->expected_return = NULL;
+    }
+
+    if (!verify_resolved_generic_params(c, fn, rigid_vars, ngp)) {
+        free(rigid_vars);
+        return false;
+    }
+    free(rigid_vars);
+    return true;
+}
+
 /* Params get types from the already-registered fn signature; block type must match return. */
 static bool check_fn_body(Checker *c, AstNode *fn) {
-    Type *sig = env_lookup(c->global_env, AS_FN_DECL(fn).name);
+    Type *sig;
+
+    if (AS_FN_DECL(fn).generic_params) {
+        return check_generic_fn_body(c, fn);
+    }
+
+    sig = env_lookup(c->global_env, AS_FN_DECL(fn).name);
     if (!sig || prune(sig)->kind != TY_FN) {
         checker_fail(c, fn->loc, "internal: missing function signature");
         return false;
@@ -2330,13 +3428,54 @@ static bool register_struct(Checker *c, AstNode *st) {
     size_t nf;
     size_t i;
 
-    if (AS_STRUCT_DECL(st).generic_params) {
-        checker_fail(c, st->loc, "generic structs not supported yet");
-        return false;
-    }
     if (env_lookup(c->global_env, nm)) {
         checker_fail(c, st->loc, "duplicate struct or function name");
         return false;
+    }
+
+    if (AS_STRUCT_DECL(st).generic_params) {
+        Env tenv = {0};
+        AstList *gp;
+        for (gp = AS_STRUCT_DECL(st).generic_params; gp; gp = gp->next) {
+            AstNode *gpn = gp->item;
+            Type *tv;
+            if (!gpn || gpn->kind != NODE_GENERIC_PARAM) {
+                env_free_head(&tenv);
+                checker_fail(c, st->loc, "internal: generic parameter");
+                return false;
+            }
+            tv = new_var(c);
+            if (!tv) {
+                env_free_head(&tenv);
+                checker_fail(c, st->loc, "out of memory");
+                return false;
+            }
+            env_insert(&tenv, AS_GENERIC_PARAM(gpn).name, tv);
+        }
+        for (fl = AS_STRUCT_DECL(st).fields; fl; fl = fl->next) {
+            AstNode *sf = fl->item;
+            if (AS_STRUCT_FIELD(sf).type == NULL) {
+                env_free_head(&tenv);
+                checker_fail(c, sf->loc, "struct field type required");
+                return false;
+            }
+            (void)ast_type_to_type_ex(c, AS_STRUCT_FIELD(sf).type, &tenv);
+            if (c->error) {
+                env_free_head(&tenv);
+                return false;
+            }
+        }
+        env_free_head(&tenv);
+
+        t = alloc_type(c);
+        if (!t) {
+            checker_fail(c, st->loc, "out of memory");
+            return false;
+        }
+        t->kind = TY_GENERIC_STRUCT;
+        t->as.g_schema.decl = st;
+        env_insert(c->global_env, nm, t);
+        return true;
     }
 
     nf = ast_list_len(AS_STRUCT_DECL(st).fields);

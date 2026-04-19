@@ -907,6 +907,7 @@ static int vm_run_smoke_table(AstNode *program, CompileProgramResult *bc) {
         {"smoke_try_catch_cross_call", 'i', 12, 0.0f, 0.0},
         {"smoke_try_finally", 'i', 7, 0.0f, 0.0},
         {"smoke_try_catch_finally", 'i', 16, 0.0f, 0.0},
+        {"smoke_try_return", 'i', 40, 0.0f, 0.0},
     };
     size_t i;
     for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {

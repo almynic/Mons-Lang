@@ -148,6 +148,8 @@ postfix_expr    = primary_expr { postfix_op } ;
 postfix_op      = "." IDENT                             (* field access  *)
                 | "." IDENT "(" [ arg_list ] ")"        (* method call   *)
                 | "[" expr "]"                           (* index         *)
+                | "::" "<" type { "," type } ">" "(" [ arg_list ] ")"   (* generic call: f::<T>(...) *)
+                | "::" "<" type { "," type } ">"        (* then `{` on IDENT: Ty::<T> { ... } *)
                 | "(" [ arg_list ] ")" ;                (* function call  *)
 
 primary_expr    = literal

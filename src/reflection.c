@@ -52,6 +52,9 @@ static void fprint_type(FILE *fp, const AstNode *t) {
                 fputc(']', fp);
             }
             break;
+        case NODE_TYPE_SELF:
+            fputs("Self", fp);
+            break;
         case NODE_TYPE_ARRAY:
             fputc('[', fp);
             fprint_type(fp, AS_TYPE_ARRAY(t).elem_type);

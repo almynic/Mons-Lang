@@ -269,3 +269,49 @@ pub fn smoke_try_catch_finally() -> int {
     };
     x
 }
+
+
+pub fn smoke_try_return() -> int {
+    try {
+        return 40;
+    } catch (e: int) {
+        0
+    } finally {
+        let _k = 1;
+    };
+    0
+}
+
+pub fn smoke_try_return_overridden_by_finally_throw() -> int {
+    let mut y = 0;
+    try {
+        try {
+            return 5;
+        } catch (e: int) {
+            0
+        } finally {
+            throw 9;
+        };
+    } catch (e: int) {
+        y = e;
+    };
+    y
+}
+
+pub fn smoke_try_return_caught_after_finally_throw() -> int {
+    let mut x = 0;
+    try {
+        try {
+            return 5;
+        } catch (e: int) {
+            0
+        } finally {
+            throw 9;
+        };
+        1
+    } catch (e: int) {
+        x = e;
+        x
+    };
+    x
+}

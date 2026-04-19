@@ -27,6 +27,7 @@ test: $(BIN)
 	./$(BIN) tests/use_tree_ok.mons
 	./$(BIN) tests/closure.mons
 	./$(BIN) tests/trait_impl.mons
+	./$(BIN) tests/generics_trait_bounds.mons
 	! ./$(BIN) tests/use_missing.mons > /dev/null 2>&1
 	! ./$(BIN) tests/use_tree_missing.mons > /dev/null 2>&1
 	! ./$(BIN) tests/use_cycle_a.mons > /dev/null 2>&1

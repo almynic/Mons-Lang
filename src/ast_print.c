@@ -182,6 +182,11 @@ static void ast_print_node(const AstNode *n, int indent) {
         case NODE_CALL:
             printf("CALL\n");
             ast_print_node(AS_CALL(n).callee, indent + 2);
+            if (AS_CALL(n).type_args) {
+                print_indent(indent + 2);
+                printf("TYPE_ARGS\n");
+                print_list(AS_CALL(n).type_args, indent + 4, ast_print_node);
+            }
             print_list(AS_CALL(n).args, indent + 2, ast_print_node);
             break;
         case NODE_IDENT:
@@ -220,6 +225,9 @@ static void ast_print_node(const AstNode *n, int indent) {
         case NODE_TYPE_NAMED:
             printf("TYPE_NAMED %s\n", AS_TYPE_NAMED(n).name);
             print_list(AS_TYPE_NAMED(n).type_args, indent + 2, ast_print_node);
+            break;
+        case NODE_TYPE_SELF:
+            printf("TYPE_SELF\n");
             break;
         case NODE_TYPE_ARRAY:
             printf("TYPE_ARRAY\n");

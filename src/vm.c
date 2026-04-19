@@ -10,6 +10,7 @@
 #define VM_STACK_CAP 512u
 #define VM_MAX_DEPTH 256u
 #define VM_TRY_CAP 256u
+#define VM_RETURN_SENTINEL "__mons_bc_return__"
 
 static void vm_fail(VmResult *out, const char *msg) {
     out->ok = false;
@@ -50,6 +51,23 @@ static int cmp_int_values(const Value *a, const Value *b) {
         return 1;
     }
     return 0;
+}
+
+static int vm_try_extract_return_signal(const Value *ex, Value *out_ret) {
+    if (!ex || !out_ret) {
+        return 0;
+    }
+    if (ex->kind != VAL_TUPLE || !ex->as.seq || ex->as.seq->len != 2u) {
+        return 0;
+    }
+    if (ex->as.seq->items[0].kind != VAL_STRING || !ex->as.seq->items[0].as.s) {
+        return 0;
+    }
+    if (strcmp(ex->as.seq->items[0].as.s, VM_RETURN_SENTINEL) != 0) {
+        return 0;
+    }
+    *out_ret = value_retain(ex->as.seq->items[1]);
+    return 1;
 }
 
 typedef struct {
@@ -1199,6 +1217,28 @@ double_op_done:
                         break;
                     }
                     if (ntry == 0) {
+                        Value rv;
+                        int old_depth;
+                        if (vm_try_extract_return_signal(&ex, &rv)) {
+                            value_release(&ex);
+                            old_depth = depth;
+                            free_frame_locals(&fr[depth]);
+                            depth--;
+                            while (ntry > 0 && try_stack[ntry - 1u].frame_depth >= old_depth) {
+                                ntry--;
+                            }
+                            if (depth < 0) {
+                                out.result = rv;
+                                out.ok = true;
+                                goto vm_cleanup;
+                            }
+                            stack_push(stack, &sp, VM_STACK_CAP, rv, &out, &err);
+                            if (err) {
+                                value_release(&rv);
+                                goto vm_cleanup;
+                            }
+                            goto reload;
+                        }
                         value_release(&ex);
                         vm_fail(&out, "uncaught exception");
                         err = 1;

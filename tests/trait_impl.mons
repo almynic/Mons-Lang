@@ -1,11 +1,11 @@
 // Trait declarations + `impl Trait for Type` (type checker + interpreter + bytecode dispatch).
 
 trait Bump {
-    fn bump(self: Counter) -> int;
+    fn bump(self: Self) -> int;
 }
 
 trait Zero {
-    fn as_zero(self: Counter) -> int;
+    fn as_zero(self: Self) -> int;
 }
 
 struct Counter {
